@@ -93,7 +93,8 @@ def build(path):
         "FO  = Front-Office (Mo-Do je 10 h, Fr 8 h) - blau",
         "BO  = Back-Office (8 h) - grün",
         "frei = Ausgleichs-Freitag nach der Front-Office-Woche - grau",
-        "Urlaub = Urlaubstag (Zeiträume auf Blatt 'Urlaub' eintragen) - gelb",
+        "Urlaub = Urlaubstag (Zeiträume auf Blatt 'Urlaub' eintragen, - gelb",
+        "  mehrere Urlaube pro Person = mehrere Zeilen mit gleichem Namen)",
         "Feiertagsname = arbeitsfrei (Feiertag im eigenen Bundesland) - rot",
         "",
         "Jedes/r Mitarbeiter/in ist alle N Wochen (N = Anzahl Mitarbeiter)",
@@ -174,10 +175,12 @@ def build(path):
     for r in range(2, 2 + URLAUB_ROWS):
         ur.cell(row=r, column=2).number_format = "DD.MM.YYYY"
         ur.cell(row=r, column=3).number_format = "DD.MM.YYYY"
-    dv2 = DataValidation(type="list", formula1="=MitarbeiterNamen",
-                         allow_blank=True, showDropDown=False)
+    dv2 = DataValidation(type="list", formula1="MitarbeiterNamen",
+                         allow_blank=True)
     ur.add_data_validation(dv2)
     dv2.add(f"A2:A{1 + URLAUB_ROWS}")
+    ur["E1"] = "Mehrere Urlaube pro Person: einfach mehrere Zeilen mit demselben Namen eintragen."
+    ur["E1"].font = Font(italic=True)
     ur.column_dimensions["A"].width = 28
     ur.column_dimensions["B"].width = 12
     ur.column_dimensions["C"].width = 12
