@@ -134,7 +134,8 @@ def build(path):
         "Legende:",
         "FO  = Front-Office (Mo-Do je 10 h, Fr 8 h) - blau",
         "BO  = Back-Office (8 h) - grün",
-        "frei = Ausgleichs-Freitag nach der Front-Office-Woche - grau",
+        "frei = Ausgleichs-Freitag nach kompletter FO-Woche (Mo-Do) - grau",
+        "(eine reine Freitag-Vertretung gibt keinen frei-Tag),",
         "Urlaub = Urlaubstag (Zeiträume auf Blatt 'Urlaub' eintragen) - gelb",
         "Feiertagsname = arbeitsfrei (Feiertag im eigenen Bundesland) - rot",
         "Jede zweite Woche ist im Roster hellgrau unterlegt (Wochenwechsel).",
@@ -252,12 +253,14 @@ def build(path):
     # Columns: A..H = FO assignee 1..MAX_FO, I = FO base,
     # K..BR = absence flags (vacation/holiday), BS.. = blocked flags
     # (absent OR wasFOprev), EA = MonRow helper, EB.. = wasFOprev flags
-    # (actually worked FO in the previous duty block)
+    # (FO in previous duty block), then MT.. = wasFO Mon-Thu of current week
+    # (used for the off-Friday: only a full FO week earns the Friday off)
     ca = wb.create_sheet("Calc")
     ABSENT0 = 11            # column K
     BLOCK0 = ABSENT0 + MAX_EMP  # column BS
     MONROW = BLOCK0 + MAX_EMP   # column EA
     WASFO0 = MONROW + 1          # column EB
+    MT0 = WASFO0 + MAX_EMP       # was-FO-Mon-Thu matrix
     absent_last = get_column_letter(ABSENT0 + MAX_EMP - 1)
     block_col = get_column_letter(BLOCK0)
     block_last = get_column_letter(BLOCK0 + MAX_EMP - 1)
@@ -307,6 +310,12 @@ def build(path):
             ca.cell(row=r, column=BLOCK0 + i, value=(
                 f'=IF(Roster!$A{rr}="","",OR({get_column_letter(ABSENT0 + i)}{r},'
                 f'{get_column_letter(WASFO0 + i)}{r}))'))
+            # Mon-Thu-only variant for the off-Friday (Friday rows: r-4..r-1)
+            mt = [f'INDEX(${col}$2:${col}${r - 1},{p - 1})={i}'
+                  for col in fo_cols for p in (r - 4, r - 3, r - 2, r - 1) if p >= 2]
+            mt = "OR(" + ",".join(mt) + ")" if mt else "FALSE"
+            ca.cell(row=r, column=MT0 + i, value=(
+                f'=IF(OR(Roster!$A{rr}="",{wd}<>5),"",{mt})'))
         for j in range(1, MAX_FO + 1):
             if j == 1:
                 start = f'MOD($I{r},Config!$E$3)'
@@ -380,7 +389,7 @@ def build(path):
                 f'=IF(OR($A{r}="",Config!$E$3=0,Config!$A${cr}=""),"",'
                 f'IF({vac},"Urlaub",'
                 f'IF({h}<>"",{h},'
-                f'IF(AND(WEEKDAY($A{r},2)=5,Calc!${get_column_letter(WASFO0 + i)}{cr_calc}=TRUE),"frei",'
+                f'IF(AND(WEEKDAY($A{r},2)=5,Calc!${get_column_letter(MT0 + i)}{cr_calc}=TRUE),"frei",'
                 f'IF({fo_match},"FO","BO")))))'
             )
             cell = ro.cell(row=r, column=4 + i, value=formula)
