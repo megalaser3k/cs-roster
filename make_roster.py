@@ -249,16 +249,19 @@ def build(path):
     # Week anchor DATE(2000,1,3) is a Monday in both Excel's and LibreOffice's
     # serial systems, so INT((date-anchor)/7) increments exactly on Mondays.
     # Calc row r (2..264) mirrors Roster data row r+1 (3..265).
-    # Columns: A..H = FO assignee 1..MAX_FO, I = FO base, J = frei base,
+    # Columns: A..H = FO assignee 1..MAX_FO, I = FO base,
     # K..BR = absence flags (vacation/holiday), BS.. = blocked flags
-    # (absent OR actually worked FO in the previous duty block), last col = MonRow helper
+    # (absent OR wasFOprev), EA = MonRow helper, EB.. = wasFOprev flags
+    # (actually worked FO in the previous duty block)
     ca = wb.create_sheet("Calc")
     ABSENT0 = 11            # column K
     BLOCK0 = ABSENT0 + MAX_EMP  # column BS
-    MONROW = BLOCK0 + MAX_EMP   # helper: Calc row of the current week's Monday
+    MONROW = BLOCK0 + MAX_EMP   # column EA
+    WASFO0 = MONROW + 1          # column EB
     absent_last = get_column_letter(ABSENT0 + MAX_EMP - 1)
     block_col = get_column_letter(BLOCK0)
     block_last = get_column_letter(BLOCK0 + MAX_EMP - 1)
+    wasfo_col = get_column_letter(WASFO0)
     fo_cols = [get_column_letter(1 + j) for j in range(MAX_FO)]
     for r in range(2, 2 + ROSTER_ROWS):
         rr = r + 1  # roster data row
@@ -275,8 +278,6 @@ def build(path):
         blockw = f'({w}-IF(WEEKDAY(Roster!$A{rr},2)=5,0,1))'
         fobase = f'MOD({blockw}*Config!$E$4,Config!$E$3)'
         ca.cell(row=r, column=9, value=f'=IF(Roster!$A{rr}="","",{fobase})')
-        ca.cell(row=r, column=10,
-                value=f'=IF(Roster!$A{rr}="","",MOD(({w}-1)*Config!$E$4,Config!$E$3))')
         mc = f'${get_column_letter(MONROW)}{r}'
         ca.cell(row=r, column=MONROW,
                 value=f'=IF(Roster!$A{rr}="","",ROW()-WEEKDAY(Roster!$A{rr},2)+1)')
@@ -301,8 +302,11 @@ def build(path):
                 elif mon:
                     terms.append(f'IF({wd}<5,OR({",".join(mon)}),FALSE)')
             was_prev = "OR(" + ",".join(terms) + ")" if terms else "FALSE"
+            ca.cell(row=r, column=WASFO0 + i, value=(
+                f'=IF(Roster!$A{rr}="","",{was_prev})'))
             ca.cell(row=r, column=BLOCK0 + i, value=(
-                f'=IF(Roster!$A{rr}="","",OR({get_column_letter(ABSENT0 + i)}{r},{was_prev}))'))
+                f'=IF(Roster!$A{rr}="","",OR({get_column_letter(ABSENT0 + i)}{r},'
+                f'{get_column_letter(WASFO0 + i)}{r}))'))
         for j in range(1, MAX_FO + 1):
             if j == 1:
                 start = f'MOD($I{r},Config!$E$3)'
@@ -372,14 +376,11 @@ def build(path):
                    f'Urlaub!$C$2:$C${1 + URLAUB_ROWS},">="&$A{r})>0')
             fo_match = "OR(" + ",".join(
                 f"Calc!${get_column_letter(1 + j)}{cr_calc}={i}" for j in range(MAX_FO)) + ")"
-            frei_terms = ",".join(
-                f'AND({j}<Config!$E$4,MOD(Calc!$J{cr_calc}+{j},Config!$E$3)={i})'
-                for j in range(MAX_FO))
             formula = (
                 f'=IF(OR($A{r}="",Config!$E$3=0,Config!$A${cr}=""),"",'
                 f'IF({vac},"Urlaub",'
                 f'IF({h}<>"",{h},'
-                f'IF(AND(WEEKDAY($A{r},2)=5,OR({frei_terms})),"frei",'
+                f'IF(AND(WEEKDAY($A{r},2)=5,Calc!${wasfo_col}{cr_calc}=TRUE),"frei",'
                 f'IF({fo_match},"FO","BO")))))'
             )
             cell = ro.cell(row=r, column=4 + i, value=formula)
