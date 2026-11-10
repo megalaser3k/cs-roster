@@ -14,7 +14,7 @@ import re
 import shutil
 import zipfile
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, Protection
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table, TableStyleInfo, TableColumn
@@ -67,6 +67,25 @@ FILL_FREI = PatternFill("solid", fgColor="FFD9D9D9", bgColor="FFD9D9D9")     # g
 FILL_URLAUB = PatternFill("solid", fgColor="FFFFEB9C", bgColor="FFFFEB9C")   # yellow
 FILL_HOLIDAY = PatternFill("solid", fgColor="FFFFC7CE", bgColor="FFFFC7CE")  # red
 FILL_WEEK = PatternFill("solid", fgColor="FFEDEDED", bgColor="FFEDEDED")     # week band
+FILL_INPUT = PatternFill("solid", fgColor="FFFFF2CC", bgColor="FFFFF2CC")    # editable input cells
+
+
+def unlock(ws, ref):
+    """Mark input cells as editable (unlocked) and colour them yellow."""
+    cells = ws[ref]
+    if not isinstance(cells, tuple):
+        cells = ((cells,),)
+    for row in cells:
+        for c in row:
+            c.protection = Protection(locked=False)
+            c.fill = FILL_INPUT
+
+
+def protect(ws):
+    """Lock the sheet (formulas read-only) but keep table filter/sort usable."""
+    ws.protection.sheet = True
+    ws.protection.autoFilter = False
+    ws.protection.sort = False
 
 
 def build(path):
@@ -137,12 +156,21 @@ def build(path):
         "verschoben, wenn die geplante Person Urlaub/Feiertag hat.",
         "",
         "Zukunftssicher: Zum Jahreswechsel nur das Jahr in B3 ändern.",
+        "",
+        "Alle Blätter sind schreibgeschützt; nur die gelb markierten",
+        "Eingabefelder (Jahr, FO-Staerke, Namen/Bundesländer, Urlaub)",
+        "sind bearbeitbar. Schutz ohne Passwort (Blatt entsperren via",
+        "Überprüfen > Blattschutz aufheben, falls nötig).",
     ]
     for i, line in enumerate(legend, start=7):
         cfg[f"D{i}"] = line
     cfg.column_dimensions["A"].width = 28
     cfg.column_dimensions["B"].width = 14
     cfg.column_dimensions["D"].width = 62
+    unlock(cfg, "B3")
+    unlock(cfg, "E4")
+    unlock(cfg, f"A{FIRST_EMP_ROW}:B{LAST_EMP_ROW}")
+    protect(cfg)
 
     # ---------------- Feiertage ----------------
     ft = wb.create_sheet("Feiertage")
@@ -194,6 +222,7 @@ def build(path):
                 cell.number_format = "DD.MM.YYYY"
     ft.column_dimensions["T"].width = 26
     ft.freeze_panes = "B2"
+    protect(ft)
 
     # ---------------- Urlaub ----------------
     ur = wb.create_sheet("Urlaub")
@@ -213,6 +242,8 @@ def build(path):
     ur.column_dimensions["B"].width = 12
     ur.column_dimensions["C"].width = 12
     ur.freeze_panes = "A2"
+    unlock(ur, f"A2:C{1 + URLAUB_ROWS}")
+    protect(ur)
 
     # ------------- Calc (hidden: FO assignees, bases, absence/blocked matrix) -------------
     # Week anchor DATE(2000,1,3) is a Monday in both Excel's and LibreOffice's
@@ -296,6 +327,7 @@ def build(path):
             ca.cell(row=r, column=j,
                     value=f'=IF({guard},"",{chain})')
     ca.sheet_state = "hidden"
+    protect(ca)
 
     # ---------------- Roster ----------------
     ro = wb.create_sheet("Roster")
@@ -387,6 +419,7 @@ def build(path):
     for i in range(MAX_EMP):
         ro.column_dimensions[get_column_letter(4 + i)].width = 12
     ro.freeze_panes = "D3"
+    protect(ro)
 
     # ---------------- Auswertung ----------------
     aw = wb.create_sheet("Auswertung")
@@ -418,6 +451,7 @@ def build(path):
     for j in range(3, 10):
         aw.column_dimensions[get_column_letter(j)].width = 13
     aw.freeze_panes = "A2"
+    protect(aw)
 
     wb.calculation.fullCalcOnLoad = True
     wb.save(path)
