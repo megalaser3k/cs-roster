@@ -380,7 +380,7 @@ def build(path):
                 f'=IF(OR($A{r}="",Config!$E$3=0,Config!$A${cr}=""),"",'
                 f'IF({vac},"Urlaub",'
                 f'IF({h}<>"",{h},'
-                f'IF(AND(WEEKDAY($A{r},2)=5,Calc!${wasfo_col}{cr_calc}=TRUE),"frei",'
+                f'IF(AND(WEEKDAY($A{r},2)=5,Calc!${get_column_letter(WASFO0 + i)}{cr_calc}=TRUE),"frei",'
                 f'IF({fo_match},"FO","BO")))))'
             )
             cell = ro.cell(row=r, column=4 + i, value=formula)
