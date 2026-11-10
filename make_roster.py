@@ -95,7 +95,7 @@ def build(path):
     cfg["D5"] = "FO-Plausibilität"
     cfg["D5"].font = Font(bold=True)
     cfg["E5"] = ('=IF(E3=0,"-",IF(2*E4>E3,'
-                 '"ACHTUNG: 2x FO-Staerke > Mitarbeiter - doppelte FO-Wochen in Folge moeglich",'
+                 '"HINWEIS: 2x FO-Staerke > Mitarbeiter - FO-Abdeckung evtl. reduziert",'
                  '"OK"))')
 
     cfg["A5"] = "Name"
@@ -125,8 +125,9 @@ def build(path):
         "Gruppe von K Personen - Freitag der Start, dann Mo-Do der",
         "Folgewoche, der folgende Freitag ist frei (10-h-Tage Mo-Do).",
         "Niemand arbeitet zwei FO-Wochen hintereinander: die Vertretung",
-        "(Urlaub/Feiertag) springt nie auf Personen der Vor- oder Folgewoche.",
-        "Ausnahme: wenn alle infrage kommen, bleibt FO an dem Tag unbesetzt.",
+        "(Urlaub/Feiertag) geht an die naechste freie Person, aber nie an",
+        "jemanden, der in der Vorwoche schon FO hatte. Ist niemand frei,",
+        "bleibt FO an dem Tag unbesetzt.",
         "",
         "Das Roster-Blatt ist eine Tabelle: Filtern über die Kopfzeile",
         "(Zeile 2). Zeile 1 zeigt die Namen aus dieser Config-Tabelle;",
@@ -219,11 +220,13 @@ def build(path):
     # Calc row r (2..264) mirrors Roster data row r+1 (3..265).
     # Columns: A..H = FO assignee 1..MAX_FO, I = FO base, J = frei base,
     # K..BR = absence flags (vacation/holiday), BS.. = blocked flags
-    # (absent OR scheduled in previous/next duty block)
+    # (absent OR actually worked FO in the previous duty block), last col = MonRow helper
     ca = wb.create_sheet("Calc")
     ABSENT0 = 11            # column K
     BLOCK0 = ABSENT0 + MAX_EMP  # column BS
+    MONROW = BLOCK0 + MAX_EMP   # helper: Calc row of the current week's Monday
     absent_last = get_column_letter(ABSENT0 + MAX_EMP - 1)
+    block_col = get_column_letter(BLOCK0)
     block_last = get_column_letter(BLOCK0 + MAX_EMP - 1)
     fo_cols = [get_column_letter(1 + j) for j in range(MAX_FO)]
     for r in range(2, 2 + ROSTER_ROWS):
@@ -243,32 +246,53 @@ def build(path):
         ca.cell(row=r, column=9, value=f'=IF(Roster!$A{rr}="","",{fobase})')
         ca.cell(row=r, column=10,
                 value=f'=IF(Roster!$A{rr}="","",MOD(({w}-1)*Config!$E$4,Config!$E$3))')
-        # blocked = absent OR scheduled in the previous OR next duty block,
-        # so the absence fallback can never create two consecutive FO weeks
+        mc = f'${get_column_letter(MONROW)}{r}'
+        ca.cell(row=r, column=MONROW,
+                value=f'=IF(Roster!$A{rr}="","",ROW()-WEEKDAY(Roster!$A{rr},2)+1)')
+        # blocked = absent OR actually assigned FO on any day of the previous
+        # duty block. Previous block rows (Calc rows): on a Friday -> r-5..r-1;
+        # on Mon-Thu -> MonRow-6..MonRow-2 (via INDEX, clamped to valid rows).
+        wd = f'WEEKDAY(Roster!$A{rr},2)'
         for i in range(MAX_EMP):
-            neigh = []
-            for bw in (f'({blockw}-1)', f'({blockw}+1)'):
-                for j in range(MAX_FO):
-                    neigh.append(f'AND({j}<Config!$E$4,MOD({bw}*Config!$E$4+{j},Config!$E$3)={i})')
+            terms = []
+            for col in fo_cols:
+                # INDEX range ends at r-1 so the formula never references its
+                # own row (avoids circular-reference detection in Excel)
+                fri = [f'INDEX(${col}$2:${col}${r - 1},{p - 1})={i}'
+                       for p in (r - 5, r - 4, r - 3, r - 2, r - 1) if p >= 2]
+                mon = [f'IF(AND({mc}-{d}-1>=1,{mc}-{d}-1<={r - 2}),'
+                       f'INDEX(${col}$2:${col}${r - 1},{mc}-{d}-1)={i},FALSE)'
+                       for d in (6, 5, 4, 3, 2)] if r >= 3 else []
+                if fri and mon:
+                    terms.append(f'IF({wd}=5,OR({",".join(fri)}),OR({",".join(mon)}))')
+                elif fri:
+                    terms.append(f'IF({wd}=5,OR({",".join(fri)}),FALSE)')
+                elif mon:
+                    terms.append(f'IF({wd}<5,OR({",".join(mon)}),FALSE)')
+            was_prev = "OR(" + ",".join(terms) + ")" if terms else "FALSE"
             ca.cell(row=r, column=BLOCK0 + i, value=(
-                f'=IF(Roster!$A{rr}="","",OR({get_column_letter(ABSENT0 + i)}{r},'
-                f'OR({",".join(neigh)})))'))
+                f'=IF(Roster!$A{rr}="","",OR({get_column_letter(ABSENT0 + i)}{r},{was_prev}))'))
         for j in range(1, MAX_FO + 1):
             if j == 1:
                 start = f'MOD($I{r},Config!$E$3)'
                 guard = f'OR(Roster!$A{rr}="",Config!$E$4<{j})'
             else:
-                prevcell = f'{get_column_letter(j - 1)}{r}'
+                prevcell = f'{fo_cols[j - 2]}{r}'
                 start = f'MOD(IF({prevcell}="",0,{prevcell})+1,Config!$E$3)'
                 guard = f'OR(Roster!$A{rr}="",Config!$E$4<{j},{prevcell}="")'
 
             def blocked(k, start=start, r=r):
-                return (f'INDEX(${get_column_letter(BLOCK0)}{r}:${block_last}{r},1,'
+                return (f'INDEX(${block_col}{r}:${block_last}{r},1,'
                         f'MOD({start}+{k},Config!$E$3)+1)')
+
+            def assigned(k, start=start, r=r, j=j):
+                terms = [f'${c}{r}=MOD({start}+{k},Config!$E$3)' for c in fo_cols[:j - 1]]
+                return "OR(" + ",".join(terms) + ")" if terms else "FALSE"
 
             chain = '""'
             for k in range(FO_DEPTH - 1, -1, -1):
-                chain = f'IF(NOT({blocked(k)}),MOD({start}+{k},Config!$E$3),{chain})'
+                chain = (f'IF(NOT(OR({blocked(k)},{assigned(k)})),'
+                         f'MOD({start}+{k},Config!$E$3),{chain})')
             ca.cell(row=r, column=j,
                     value=f'=IF({guard},"",{chain})')
     ca.sheet_state = "hidden"
