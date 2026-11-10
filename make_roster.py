@@ -130,6 +130,16 @@ def build(path):
 
     wb.defined_names["MitarbeiterNamen"] = DefinedName(
         "MitarbeiterNamen", attr_text=f"Config!$A${FIRST_EMP_ROW}:$A${LAST_EMP_ROW}")
+    for name, ref in [
+        ("N_MA", "Config!$E$3"), ("K_FO", "Config!$E$4"), ("JAHR", "Config!$B$3"),
+        ("ANKER", "Calc!$J$1"),
+        ("URL_A", f"Urlaub!$A$2:$A${1 + URLAUB_ROWS}"),
+        ("URL_B", f"Urlaub!$B$2:$B${1 + URLAUB_ROWS}"),
+        ("URL_C", f"Urlaub!$C$2:$C${1 + URLAUB_ROWS}"),
+        ("FT_A", "Feiertage!$A$2:$A$18"), ("FT_BQ", "Feiertage!$B$2:$Q$18"),
+        ("FT_H", "Feiertage!$B$1:$Q$1"),
+    ]:
+        wb.defined_names[name] = DefinedName(name, attr_text=ref)
 
     legend = [
         "Legende:",
@@ -248,106 +258,106 @@ def build(path):
     unlock(ur, f"A2:C{1 + URLAUB_ROWS}")
     protect(ur)
 
-    # ------------- Calc (hidden: FO assignees, bases, absence/blocked matrix) -------------
-    # Week anchor DATE(2000,1,3) is a Monday in both Excel's and LibreOffice's
-    # serial systems, so INT((date-anchor)/7) increments exactly on Mondays.
+    # ------------- Calc (hidden, size-optimized) -------------
+    # Week anchor: named cell ANKER = Calc!$J$1 = DATE(2000,1,3), a Monday in
+    # both Excel's and LibreOffice's serial systems.
     # Calc row r (2..264) mirrors Roster data row r+1 (3..265).
-    # Columns: A..H = FO assignee 1..MAX_FO, I = FO base,
-    # K..BR = absence flags (vacation/holiday), BS.. = blocked flags
-    # (absent OR wasFOprev), EA = MonRow helper, EB.. = wasFOprev flags
-    # (FO in previous duty block), then MT.. = wasFO Mon-Thu of current week
-    # (used for the off-Friday: only a full FO week earns the Friday off)
+    # Columns: A..H = FO assignees, I = FO base, J = FOSet (","-joined assignees),
+    # K..BR = absence flags, BS.. = blocked flags, EA = MonRow helper,
+    # EB.. = wasFOprev, GL.. = wasFO Mon-Thu (for the off-Friday).
+    # wasFO/MT use short SEARCH checks against FOSet instead of per-slot INDEX.
     ca = wb.create_sheet("Calc")
     ABSENT0 = 11            # column K
     BLOCK0 = ABSENT0 + MAX_EMP  # column BS
     MONROW = BLOCK0 + MAX_EMP   # column EA
     WASFO0 = MONROW + 1          # column EB
-    MT0 = WASFO0 + MAX_EMP       # was-FO-Mon-Thu matrix
+    MT0 = WASFO0 + MAX_EMP       # column GL
+    FOSET = 10                   # column J
     absent_last = get_column_letter(ABSENT0 + MAX_EMP - 1)
     block_col = get_column_letter(BLOCK0)
     block_last = get_column_letter(BLOCK0 + MAX_EMP - 1)
-    wasfo_col = get_column_letter(WASFO0)
     fo_cols = [get_column_letter(1 + j) for j in range(MAX_FO)]
+    ca["I1"] = "anker (Montag)"
+    ca["J1"] = "=DATE(2000,1,3)"
+    ca["J1"].number_format = "DD.MM.YYYY"
+    foset_range = f"$J$2:$J$"  # + (r-1) per row
     for r in range(2, 2 + ROSTER_ROWS):
         rr = r + 1  # roster data row
-        for i in range(MAX_EMP):
-            cr = FIRST_EMP_ROW + i
-            ca.cell(row=r, column=ABSENT0 + i, value=(
-                f'=IF(Roster!$A{rr}="","",OR('
-                f'COUNTIFS(Urlaub!$A$2:$A${1 + URLAUB_ROWS},Config!$A${cr},'
-                f'Urlaub!$B$2:$B${1 + URLAUB_ROWS},"<="&Roster!$A{rr},'
-                f'Urlaub!$C$2:$C${1 + URLAUB_ROWS},">="&Roster!$A{rr})>0,'
-                f'IFERROR(INDEX(Feiertage!$B$2:$Q$18,MATCH(Roster!$A{rr},Feiertage!$A$2:$A$18,0),'
-                f'MATCH(Config!$B${cr},Feiertage!$B$1:$Q$1,0)),"")<>""))'))
-        w = f'INT((Roster!$A{rr}-DATE(2000,1,3))/7)'
+        fr = foset_range + str(r - 1)
+        # FO assignees first (FOSet depends on them)
+        w = f'INT((Roster!$A{rr}-ANKER)/7)'
         blockw = f'({w}-IF(WEEKDAY(Roster!$A{rr},2)=5,0,1))'
-        fobase = f'MOD({blockw}*Config!$E$4,Config!$E$3)'
-        ca.cell(row=r, column=9, value=f'=IF(Roster!$A{rr}="","",{fobase})')
+        ca.cell(row=r, column=9,
+                value=f'=IF(Roster!$A{rr}="","",MOD({blockw}*K_FO,N_MA))')
         mc = f'${get_column_letter(MONROW)}{r}'
         ca.cell(row=r, column=MONROW,
                 value=f'=IF(Roster!$A{rr}="","",ROW()-WEEKDAY(Roster!$A{rr},2)+1)')
-        # blocked = absent OR actually assigned FO on any day of the previous
-        # duty block. Previous block rows (Calc rows): on a Friday -> r-5..r-1;
-        # on Mon-Thu -> MonRow-6..MonRow-2 (via INDEX, clamped to valid rows).
-        wd = f'WEEKDAY(Roster!$A{rr},2)'
-        for i in range(MAX_EMP):
-            terms = []
-            for col in fo_cols:
-                # INDEX range ends at r-1 so the formula never references its
-                # own row (avoids circular-reference detection in Excel)
-                fri = [f'INDEX(${col}$2:${col}${r - 1},{p - 1})={i}'
-                       for p in (r - 5, r - 4, r - 3, r - 2, r - 1) if p >= 2]
-                mon = [f'IF(AND({mc}-{d}-1>=1,{mc}-{d}-1<={r - 2}),'
-                       f'INDEX(${col}$2:${col}${r - 1},{mc}-{d}-1)={i},FALSE)'
-                       for d in (6, 5, 4, 3, 2)] if r >= 3 else []
-                if fri and mon:
-                    terms.append(f'IF({wd}=5,OR({",".join(fri)}),OR({",".join(mon)}))')
-                elif fri:
-                    terms.append(f'IF({wd}=5,OR({",".join(fri)}),FALSE)')
-                elif mon:
-                    terms.append(f'IF({wd}<5,OR({",".join(mon)}),FALSE)')
-            was_prev = "OR(" + ",".join(terms) + ")" if terms else "FALSE"
-            ca.cell(row=r, column=WASFO0 + i, value=(
-                f'=IF(Roster!$A{rr}="","",{was_prev})'))
-            ca.cell(row=r, column=BLOCK0 + i, value=(
-                f'=IF(Roster!$A{rr}="","",OR({get_column_letter(ABSENT0 + i)}{r},'
-                f'{get_column_letter(WASFO0 + i)}{r}))'))
-            # Off-Friday requires FO on ALL four Mon-Thu days of the current
-            # week (Friday rows r-4..r-1); a partial week earns no Friday off.
-            # Per day: OR over the FO-assignee slots; across days: AND.
-            days = [p for p in (r - 4, r - 3, r - 2, r - 1) if p >= 2]
-            if len(days) == 4:
-                mt = "AND(" + ",".join(
-                    "OR(" + ",".join(f'INDEX(${col}$2:${col}${r - 1},{p - 1})={i}'
-                                     for col in fo_cols) + ")"
-                    for p in days) + ")"
-            else:
-                mt = "FALSE"
-            ca.cell(row=r, column=MT0 + i, value=(
-                f'=IF(OR(Roster!$A{rr}="",{wd}<>5),"",{mt})'))
         for j in range(1, MAX_FO + 1):
             if j == 1:
-                start = f'MOD($I{r},Config!$E$3)'
-                guard = f'OR(Roster!$A{rr}="",Config!$E$4<{j})'
+                start = f'MOD($I{r},N_MA)'
+                guard = f'OR(Roster!$A{rr}="",K_FO<{j})'
             else:
                 prevcell = f'{fo_cols[j - 2]}{r}'
-                start = f'MOD(IF({prevcell}="",0,{prevcell})+1,Config!$E$3)'
-                guard = f'OR(Roster!$A{rr}="",Config!$E$4<{j},{prevcell}="")'
+                start = f'MOD(IF({prevcell}="",0,{prevcell})+1,N_MA)'
+                guard = f'OR(Roster!$A{rr}="",K_FO<{j},{prevcell}="")'
 
             def blocked(k, start=start, r=r):
                 return (f'INDEX(${block_col}{r}:${block_last}{r},1,'
-                        f'MOD({start}+{k},Config!$E$3)+1)')
+                        f'MOD({start}+{k},N_MA)+1)')
 
             def assigned(k, start=start, r=r, j=j):
-                terms = [f'${c}{r}=MOD({start}+{k},Config!$E$3)' for c in fo_cols[:j - 1]]
+                terms = [f'${c}{r}=MOD({start}+{k},N_MA)' for c in fo_cols[:j - 1]]
                 return "OR(" + ",".join(terms) + ")" if terms else "FALSE"
 
             chain = '""'
             for k in range(FO_DEPTH - 1, -1, -1):
                 chain = (f'IF(NOT(OR({blocked(k)},{assigned(k)})),'
-                         f'MOD({start}+{k},Config!$E$3),{chain})')
-            ca.cell(row=r, column=j,
-                    value=f'=IF({guard},"",{chain})')
+                         f'MOD({start}+{k},N_MA),{chain})')
+            ca.cell(row=r, column=j, value=f'=IF({guard},"",{chain})')
+        foset_sep = '&","&'
+        ca.cell(row=r, column=FOSET, value=(
+            f'=IF(Roster!$A{rr}="","",","&{foset_sep.join(f"{c}{r}" for c in fo_cols)}&",")'))
+        wd = f'WEEKDAY(Roster!$A{rr},2)'
+        for i in range(MAX_EMP):
+            cr = FIRST_EMP_ROW + i
+            ca.cell(row=r, column=ABSENT0 + i, value=(
+                f'=IF(OR(Roster!$A{rr}="",Config!$A${cr}=""),"",OR('
+                f'COUNTIFS(URL_A,Config!$A${cr},URL_B,"<="&Roster!$A{rr},'
+                f'URL_C,">="&Roster!$A{rr})>0,'
+                f'IFERROR(INDEX(FT_BQ,MATCH(Roster!$A{rr},FT_A,0),'
+                f'MATCH(Config!$B${cr},FT_H,0)),"")<>""))'))
+            # wasFOprev: was employee i assigned FO on any day of the previous
+            # duty block? Prev block rows: Friday -> r-5..r-1; Mon-Thu ->
+            # MonRow-6..MonRow-2. INDEX range ends at r-1 (no self-reference).
+            fri = [f'ISNUMBER(SEARCH(","&{i}&",",INDEX({fr},{p - 1})))'
+                   for p in (r - 5, r - 4, r - 3, r - 2, r - 1) if p >= 2]
+            mon = [f'IF(AND({mc}-{d}-1>=1,{mc}-{d}-1<={r - 2}),'
+                   f'ISNUMBER(SEARCH(","&{i}&",",INDEX({fr},{mc}-{d}-1))),FALSE)'
+                   for d in (6, 5, 4, 3, 2)] if r >= 3 else []
+            if fri and mon:
+                was_prev = f'IF({wd}=5,OR({",".join(fri)}),OR({",".join(mon)}))'
+            elif fri:
+                was_prev = f'IF({wd}=5,OR({",".join(fri)}),FALSE)'
+            elif mon:
+                was_prev = f'IF({wd}<5,OR({",".join(mon)}),FALSE)'
+            else:
+                was_prev = "FALSE"
+            ca.cell(row=r, column=WASFO0 + i, value=(
+                f'=IF(OR(Roster!$A{rr}="",Config!$A${cr}=""),"",{was_prev})'))
+            ca.cell(row=r, column=BLOCK0 + i, value=(
+                f'=IF(OR(Roster!$A{rr}="",Config!$A${cr}=""),"",'
+                f'OR({get_column_letter(ABSENT0 + i)}{r},'
+                f'{get_column_letter(WASFO0 + i)}{r}))'))
+            # Off-Friday: FO on ALL four Mon-Thu days of the current week.
+            days = [p for p in (r - 4, r - 3, r - 2, r - 1) if p >= 2]
+            if len(days) == 4:
+                mt = "AND(" + ",".join(
+                    f'ISNUMBER(SEARCH(","&{i}&",",INDEX({fr},{p - 1})))'
+                    for p in days) + ")"
+            else:
+                mt = "FALSE"
+            ca.cell(row=r, column=MT0 + i, value=(
+                f'=IF(OR(Roster!$A{rr}="",Config!$A${cr}="",{wd}<>5),"",{mt})'))
     ca.sheet_state = "hidden"
     protect(ca)
 
@@ -374,11 +384,11 @@ def build(path):
         cr_calc = r - 1  # Calc row
         if r == DATA_ROW0:
             ro.cell(row=r, column=1,
-                    value="=DATE(Config!$B$3,1,1)+IF(WEEKDAY(DATE(Config!$B$3,1,1),2)>5,8-WEEKDAY(DATE(Config!$B$3,1,1),2),0)")
+                    value="=DATE(JAHR,1,1)+IF(WEEKDAY(DATE(JAHR,1,1),2)>5,8-WEEKDAY(DATE(JAHR,1,1),2),0)")
         else:
             prev = f"$A{r - 1}"
             ro.cell(row=r, column=1,
-                    value=(f'=IF({prev}="","",IF({prev}>=DATE(Config!$B$3,12,31),"",'
+                    value=(f'=IF({prev}="","",IF({prev}>=DATE(JAHR,12,31),"",'
                            f'IF(WEEKDAY({prev},2)=5,{prev}+3,{prev}+1)))'))
         ro.cell(row=r, column=1).number_format = "DD.MM.YYYY"
         ro.cell(row=r, column=2,
@@ -387,15 +397,13 @@ def build(path):
 
         for i in range(MAX_EMP):
             cr = FIRST_EMP_ROW + i
-            h = (f'IFERROR(INDEX(Feiertage!$B$2:$Q$18,MATCH($A{r},Feiertage!$A$2:$A$18,0),'
-                 f'MATCH(Config!$B${cr},Feiertage!$B$1:$Q$1,0)),"")')
-            vac = (f'COUNTIFS(Urlaub!$A$2:$A${1 + URLAUB_ROWS},Config!$A${cr},'
-                   f'Urlaub!$B$2:$B${1 + URLAUB_ROWS},"<="&$A{r},'
-                   f'Urlaub!$C$2:$C${1 + URLAUB_ROWS},">="&$A{r})>0')
+            h = (f'IFERROR(INDEX(FT_BQ,MATCH($A{r},FT_A,0),'
+                 f'MATCH(Config!$B${cr},FT_H,0)),"")')
+            vac = (f'COUNTIFS(URL_A,Config!$A${cr},URL_B,"<="&$A{r},URL_C,">="&$A{r})>0')
             fo_match = "OR(" + ",".join(
                 f"Calc!${get_column_letter(1 + j)}{cr_calc}={i}" for j in range(MAX_FO)) + ")"
             formula = (
-                f'=IF(OR($A{r}="",Config!$E$3=0,Config!$A${cr}=""),"",'
+                f'=IF(OR($A{r}="",N_MA=0,Config!$A${cr}=""),"",'
                 f'IF({vac},"Urlaub",'
                 f'IF({h}<>"",{h},'
                 f'IF(AND(WEEKDAY($A{r},2)=5,Calc!${get_column_letter(MT0 + i)}{cr_calc}=TRUE),"frei",'
