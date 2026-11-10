@@ -107,8 +107,8 @@ def build(path):
         "Das Roster-Blatt ist eine Tabelle: Filtern über die Kopfzeile.",
         "Spalte D = 1. Person aus Config, Spalte E = 2. Person usw.",
         "",
-        "Hinweis: Fällt ein Front-Office-Tag auf Urlaub oder einen Feiertag",
-        "im eigenen Bundesland, ist die Abdeckung manuell zu planen.",
+        "Front-Office wird automatisch auf die nächste verfügbare Person",
+        "verschoben, wenn die geplante Person Urlaub/Feiertag hat.",
         "",
         "Zukunftssicher: Zum Jahreswechsel nur das Jahr in B3 ändern.",
     ]
@@ -189,6 +189,33 @@ def build(path):
     ur.column_dimensions["C"].width = 12
     ur.freeze_panes = "A2"
 
+    # ---------------- Calc (hidden helper: absence matrix + FO index) ----------------
+    # Week anchor DATE(2000,1,3) is a Monday in both Excel's and LibreOffice's
+    # serial systems, so INT((date-anchor)/7) increments exactly on Mondays.
+    ca = wb.create_sheet("Calc")
+    FO_DEPTH = 8  # FO falls back through up to 8 consecutive absent employees
+    for r in range(2, 2 + ROSTER_ROWS):
+        for i in range(MAX_EMP):
+            cr = FIRST_EMP_ROW + i
+            ca.cell(row=r, column=2 + i, value=(
+                f'=IF(Roster!$A{r}="","",OR('
+                f'COUNTIFS(Urlaub!$A$2:$A${1 + URLAUB_ROWS},Config!$A${cr},'
+                f'Urlaub!$B$2:$B${1 + URLAUB_ROWS},"<="&Roster!$A{r},'
+                f'Urlaub!$C$2:$C${1 + URLAUB_ROWS},">="&Roster!$A{r})>0,'
+                f'IFERROR(INDEX(Feiertage!$B$2:$Q$17,MATCH(Roster!$A{r},Feiertage!$A$2:$A$17,0),'
+                f'MATCH(Config!$B${cr},Feiertage!$B$1:$Q$1,0)),"")<>""))'))
+        b = (f'MOD(INT((Roster!$A{r}-DATE(2000,1,3))/7)-1'
+             f'-IF(WEEKDAY(Roster!$A{r},2)=5,0,1),Config!$E$3)')
+
+        def absent(k):
+            return f'INDEX($B{r}:${get_column_letter(1 + MAX_EMP)}{r},1,MOD({b}+{k},Config!$E$3)+1)'
+
+        chain = f'MOD({b}+{FO_DEPTH},Config!$E$3)'
+        for k in range(FO_DEPTH - 1, -1, -1):
+            chain = f'IF(NOT({absent(k)}),MOD({b}+{k},Config!$E$3),{chain})'
+        ca.cell(row=r, column=1, value=f'=IF(Roster!$A{r}="","",{chain})')
+    ca.sheet_state = "hidden"
+
     # ---------------- Roster ----------------
     ro = wb.create_sheet("Roster")
     headers = ["Datum", "Tag", "KW"] + [f"Mitarbeiter {i + 1}" for i in range(MAX_EMP)]
@@ -223,8 +250,8 @@ def build(path):
                 f'=IF(OR($A{r}="",Config!$E$3=0,Config!$A${cr}=""),"",'
                 f'IF({vac},"Urlaub",'
                 f'IF({h}<>"",{h},'
-                f'IF(AND(WEEKDAY($A{r},2)=5,MOD(INT(($A{r}-DATE(1900,1,2))/7)-2,Config!$E$3)={i}),"frei",'
-                f'IF(MOD(INT(($A{r}-DATE(1900,1,2))/7)-1-IF(WEEKDAY($A{r},2)=5,0,1),Config!$E$3)={i},"FO","BO")))))'
+                f'IF(AND(WEEKDAY($A{r},2)=5,MOD(INT(($A{r}-DATE(2000,1,3))/7)-2,Config!$E$3)={i}),"frei",'
+                f'IF(Calc!$A{r}={i},"FO","BO")))))'
             )
             cell = ro.cell(row=r, column=4 + i, value=formula)
             cell.alignment = Alignment(horizontal="center")
