@@ -224,7 +224,7 @@ def build(path):
                 f'IF({vac},"Urlaub",'
                 f'IF({h}<>"",{h},'
                 f'IF(AND(WEEKDAY($A{r},2)=5,MOD(INT(($A{r}-DATE(1900,1,2))/7)-2,Config!$E$3)={i}),"frei",'
-                f'IF(MOD(INT(($A{r}-DATE(1900,1,2))/7)-1-IF(WEEKDAY($A{r},2)=5,0,1),Config!$E$3)={i},"FO","BO"))))))'
+                f'IF(MOD(INT(($A{r}-DATE(1900,1,2))/7)-1-IF(WEEKDAY($A{r},2)=5,0,1),Config!$E$3)={i},"FO","BO")))))'
             )
             cell = ro.cell(row=r, column=4 + i, value=formula)
             cell.alignment = Alignment(horizontal="center")
@@ -294,7 +294,26 @@ def build(path):
     wb.calculation.fullCalcOnLoad = True
     wb.save(path)
     strip_empty_cached_values(path)
+    check_formula_balance(path)
     print("saved", path)
+
+
+def check_formula_balance(path):
+    """Assert every stored formula has balanced parentheses (outside strings)."""
+    with zipfile.ZipFile(path) as z:
+        for n in z.namelist():
+            if re.match(r"xl/worksheets/sheet\d+\.xml$", n):
+                for f in re.findall(r"<f[^>]*>([^<]*)</f>", z.read(n).decode()):
+                    f = f.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+                    depth = 0
+                    instr = False
+                    for ch in f:
+                        if ch == '"':
+                            instr = not instr
+                        elif not instr:
+                            depth += (ch == "(") - (ch == ")")
+                    if depth != 0:
+                        raise ValueError(f"unbalanced formula in {n}: {f[:80]}")
 
 
 def strip_empty_cached_values(path):
