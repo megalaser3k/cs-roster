@@ -9,6 +9,9 @@ Sheets:
   Auswertung - per-employee totals and hours
 """
 import datetime
+import re
+import shutil
+import zipfile
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -288,8 +291,27 @@ def build(path):
         aw.column_dimensions[get_column_letter(j)].width = 13
     aw.freeze_panes = "A2"
 
+    wb.calculation.fullCalcOnLoad = True
     wb.save(path)
+    strip_empty_cached_values(path)
     print("saved", path)
+
+
+def strip_empty_cached_values(path):
+    """Remove empty <v/> elements that openpyxl writes after <f> formulas.
+
+    A numeric cell with an empty cached <v/> is treated as corrupt by Excel,
+    which then strips the formulas on open. With no cached values present,
+    fullCalcOnLoad makes Excel recalculate everything when the file opens.
+    """
+    tmp = path + ".tmp"
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if re.match(r"xl/worksheets/sheet\d+\.xml$", item.filename):
+                data = re.sub(rb"<v\s*/>|<v></v>", b"", data)
+            zout.writestr(item, data)
+    shutil.move(tmp, path)
 
 
 if __name__ == "__main__":
