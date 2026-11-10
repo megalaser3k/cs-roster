@@ -50,7 +50,8 @@ HOLIDAYS = [
     ("Tag der Deutschen Einheit", "=DATE(Config!$B$3,10,3)",  "Dt. Einheit",    ALL),
     ("Reformationstag",         "=DATE(Config!$B$3,10,31)",   "Reformationstag", {"BB", "HB", "HH", "MV", "NI", "SN", "ST", "SH", "TH"}),
     ("Allerheiligen",           "=DATE(Config!$B$3,11,1)",    "Allerheiligen",  {"BW", "BY", "NW", "RP", "SL"}),
-    ("Buß- und Bettag",         "=DATE(Config!$B$3,11,22)-WEEKDAY(DATE(Config!$B$3,11,22),3)+2", "Buß-/Bettag", {"SN"}),
+    ("Buß- und Bettag",         "=DATE(Config!$B$3,11,23)-(WEEKDAY(DATE(Config!$B$3,11,23),1)-1)-4", "Buß-/Bettag", {"SN"}),
+    ("Weltkindertag",           "=DATE(Config!$B$3,9,20)",    "Weltkindertag",  {"TH"}),
     ("1. Weihnachtstag",        "=DATE(Config!$B$3,12,25)",   "Weihnachten",    ALL),
     ("2. Weihnachtstag",        "=DATE(Config!$B$3,12,26)",   "2. Weihnachtstag", ALL),
 ]
@@ -276,7 +277,7 @@ def build(path):
                 f'COUNTIFS(Urlaub!$A$2:$A${1 + URLAUB_ROWS},Config!$A${cr},'
                 f'Urlaub!$B$2:$B${1 + URLAUB_ROWS},"<="&Roster!$A{rr},'
                 f'Urlaub!$C$2:$C${1 + URLAUB_ROWS},">="&Roster!$A{rr})>0,'
-                f'IFERROR(INDEX(Feiertage!$B$2:$Q$17,MATCH(Roster!$A{rr},Feiertage!$A$2:$A$17,0),'
+                f'IFERROR(INDEX(Feiertage!$B$2:$Q$18,MATCH(Roster!$A{rr},Feiertage!$A$2:$A$18,0),'
                 f'MATCH(Config!$B${cr},Feiertage!$B$1:$Q$1,0)),"")<>""))'))
         w = f'INT((Roster!$A{rr}-DATE(2000,1,3))/7)'
         blockw = f'({w}-IF(WEEKDAY(Roster!$A{rr},2)=5,0,1))'
@@ -386,7 +387,7 @@ def build(path):
 
         for i in range(MAX_EMP):
             cr = FIRST_EMP_ROW + i
-            h = (f'IFERROR(INDEX(Feiertage!$B$2:$Q$17,MATCH($A{r},Feiertage!$A$2:$A$17,0),'
+            h = (f'IFERROR(INDEX(Feiertage!$B$2:$Q$18,MATCH($A{r},Feiertage!$A$2:$A$18,0),'
                  f'MATCH(Config!$B${cr},Feiertage!$B$1:$Q$1,0)),"")')
             vac = (f'COUNTIFS(Urlaub!$A$2:$A${1 + URLAUB_ROWS},Config!$A${cr},'
                    f'Urlaub!$B$2:$B${1 + URLAUB_ROWS},"<="&$A{r},'
