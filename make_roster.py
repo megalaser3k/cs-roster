@@ -28,6 +28,8 @@ FIRST_EMP_ROW = 6
 LAST_EMP_ROW = FIRST_EMP_ROW + MAX_EMP - 1
 ROSTER_ROWS = 263  # max Mon-Fri days in a year is 262; one spare row
 URLAUB_ROWS = 200  # max vacation entries
+MAX_FO = 8      # max simultaneous front-office persons (Config!E4)
+FO_DEPTH = 8    # absence fallback chain length
 
 ALL = set(STATES)
 HOLIDAYS = [
@@ -77,6 +79,14 @@ def build(path):
     cfg["D3"] = "Anzahl Mitarbeiter"
     cfg["D3"].font = Font(bold=True)
     cfg["E3"] = f"=COUNTA(A{FIRST_EMP_ROW}:A{LAST_EMP_ROW})"
+    cfg["D4"] = "Personen im Front-Office"
+    cfg["D4"].font = Font(bold=True)
+    cfg["E4"] = 1
+    cfg["E4"].number_format = "0"
+    dv_fo = DataValidation(type="whole", operator="between",
+                           formula1="1", formula2=str(MAX_FO), allow_blank=False)
+    cfg.add_data_validation(dv_fo)
+    dv_fo.add("E4")
 
     cfg["A5"] = "Name"
     cfg["B5"] = "Bundesland"
@@ -100,9 +110,10 @@ def build(path):
         "  mehrere Urlaube pro Person = mehrere Zeilen mit gleichem Namen)",
         "Feiertagsname = arbeitsfrei (Feiertag im eigenen Bundesland) - rot",
         "",
-        "Jedes/r Mitarbeiter/in ist alle N Wochen (N = Anzahl Mitarbeiter)",
-        "im Front-Office: Freitag der Start, dann Mo-Do der Folgewoche,",
-        "der folgende Freitag ist frei.",
+        "Jedes/r Mitarbeiter/in ist alle N/K Wochen im Front-Office",
+        "(N = Anzahl Mitarbeiter, K = FO-Staerke in E4): pro Woche eine",
+        "Gruppe von K Personen - Freitag der Start, dann Mo-Do der",
+        "Folgewoche, der folgende Freitag ist frei (10-h-Tage Mo-Do).",
         "",
         "Das Roster-Blatt ist eine Tabelle: Filtern über die Kopfzeile.",
         "Spalte D = 1. Person aus Config, Spalte E = 2. Person usw.",
@@ -189,31 +200,42 @@ def build(path):
     ur.column_dimensions["C"].width = 12
     ur.freeze_panes = "A2"
 
-    # ---------------- Calc (hidden helper: absence matrix + FO index) ----------------
+    # ------------- Calc (hidden: FO assignees, bases, absence matrix) -------------
     # Week anchor DATE(2000,1,3) is a Monday in both Excel's and LibreOffice's
     # serial systems, so INT((date-anchor)/7) increments exactly on Mondays.
+    # Columns: A..H = FO assignee 1..MAX_FO, I = FO base index, J = frei base index,
+    # K.. = absence flags for employees 0..MAX_EMP-1
     ca = wb.create_sheet("Calc")
-    FO_DEPTH = 8  # FO falls back through up to 8 consecutive absent employees
+    ABSENT0 = 11  # column K
+    absent_last = get_column_letter(ABSENT0 + MAX_EMP - 1)
     for r in range(2, 2 + ROSTER_ROWS):
         for i in range(MAX_EMP):
             cr = FIRST_EMP_ROW + i
-            ca.cell(row=r, column=2 + i, value=(
+            ca.cell(row=r, column=ABSENT0 + i, value=(
                 f'=IF(Roster!$A{r}="","",OR('
                 f'COUNTIFS(Urlaub!$A$2:$A${1 + URLAUB_ROWS},Config!$A${cr},'
                 f'Urlaub!$B$2:$B${1 + URLAUB_ROWS},"<="&Roster!$A{r},'
                 f'Urlaub!$C$2:$C${1 + URLAUB_ROWS},">="&Roster!$A{r})>0,'
                 f'IFERROR(INDEX(Feiertage!$B$2:$Q$17,MATCH(Roster!$A{r},Feiertage!$A$2:$A$17,0),'
                 f'MATCH(Config!$B${cr},Feiertage!$B$1:$Q$1,0)),"")<>""))'))
-        b = (f'MOD(INT((Roster!$A{r}-DATE(2000,1,3))/7)-1'
-             f'-IF(WEEKDAY(Roster!$A{r},2)=5,0,1),Config!$E$3)')
+        w = f'INT((Roster!$A{r}-DATE(2000,1,3))/7)'
+        fobase = f'MOD(({w}-IF(WEEKDAY(Roster!$A{r},2)=5,0,1))*Config!$E$4,Config!$E$3)'
+        ca.cell(row=r, column=9, value=f'=IF(Roster!$A{r}="","",{fobase})')
+        ca.cell(row=r, column=10,
+                value=f'=IF(Roster!$A{r}="","",MOD(({w}-1)*Config!$E$4,Config!$E$3))')
+        for j in range(1, MAX_FO + 1):
+            start = f'$I{r}' if j == 1 else f'{get_column_letter(j - 1)}{r}+1'
+            start = f'MOD({start},Config!$E$3)'
 
-        def absent(k):
-            return f'INDEX($B{r}:${get_column_letter(1 + MAX_EMP)}{r},1,MOD({b}+{k},Config!$E$3)+1)'
+            def absent(k, start=start, r=r):
+                return (f'INDEX($K{r}:${absent_last}{r},1,'
+                        f'MOD({start}+{k},Config!$E$3)+1)')
 
-        chain = f'MOD({b}+{FO_DEPTH},Config!$E$3)'
-        for k in range(FO_DEPTH - 1, -1, -1):
-            chain = f'IF(NOT({absent(k)}),MOD({b}+{k},Config!$E$3),{chain})'
-        ca.cell(row=r, column=1, value=f'=IF(Roster!$A{r}="","",{chain})')
+            chain = f'MOD({start}+{FO_DEPTH},Config!$E$3)'
+            for k in range(FO_DEPTH - 1, -1, -1):
+                chain = f'IF(NOT({absent(k)}),MOD({start}+{k},Config!$E$3),{chain})'
+            ca.cell(row=r, column=j,
+                    value=f'=IF(OR(Roster!$A{r}="",Config!$E$4<{j}),"",{chain})')
     ca.sheet_state = "hidden"
 
     # ---------------- Roster ----------------
@@ -246,12 +268,17 @@ def build(path):
             vac = (f'COUNTIFS(Urlaub!$A$2:$A${1 + URLAUB_ROWS},Config!$A${cr},'
                    f'Urlaub!$B$2:$B${1 + URLAUB_ROWS},"<="&$A{r},'
                    f'Urlaub!$C$2:$C${1 + URLAUB_ROWS},">="&$A{r})>0')
+            fo_match = "OR(" + ",".join(
+                f"Calc!${get_column_letter(1 + j)}{r}={i}" for j in range(MAX_FO)) + ")"
+            frei_terms = ",".join(
+                f'AND({j}<Config!$E$4,MOD(Calc!$J{r}+{j},Config!$E$3)={i})'
+                for j in range(MAX_FO))
             formula = (
                 f'=IF(OR($A{r}="",Config!$E$3=0,Config!$A${cr}=""),"",'
                 f'IF({vac},"Urlaub",'
                 f'IF({h}<>"",{h},'
-                f'IF(AND(WEEKDAY($A{r},2)=5,MOD(INT(($A{r}-DATE(2000,1,3))/7)-2,Config!$E$3)={i}),"frei",'
-                f'IF(Calc!$A{r}={i},"FO","BO")))))'
+                f'IF(AND(WEEKDAY($A{r},2)=5,OR({frei_terms})),"frei",'
+                f'IF({fo_match},"FO","BO")))))'
             )
             cell = ro.cell(row=r, column=4 + i, value=formula)
             cell.alignment = Alignment(horizontal="center")
