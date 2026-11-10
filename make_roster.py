@@ -134,8 +134,9 @@ def build(path):
         "Legende:",
         "FO  = Front-Office (Mo-Do je 10 h, Fr 8 h) - blau",
         "BO  = Back-Office (8 h) - grün",
-        "frei = Ausgleichs-Freitag nach kompletter FO-Woche (Mo-Do) - grau",
-        "(eine reine Freitag-Vertretung gibt keinen frei-Tag),",
+        "frei = Ausgleichs-Freitag nach kompletter FO-Woche - grau",
+        "(nur bei FO an ALLEN vier Tagen Mo-Do; Teilwochen oder reine",
+        "Freitags-Vertretungen geben keinen frei-Tag),",
         "Urlaub = Urlaubstag (Zeiträume auf Blatt 'Urlaub' eintragen) - gelb",
         "Feiertagsname = arbeitsfrei (Feiertag im eigenen Bundesland) - rot",
         "Jede zweite Woche ist im Roster hellgrau unterlegt (Wochenwechsel).",
@@ -310,10 +311,17 @@ def build(path):
             ca.cell(row=r, column=BLOCK0 + i, value=(
                 f'=IF(Roster!$A{rr}="","",OR({get_column_letter(ABSENT0 + i)}{r},'
                 f'{get_column_letter(WASFO0 + i)}{r}))'))
-            # Mon-Thu-only variant for the off-Friday (Friday rows: r-4..r-1)
-            mt = [f'INDEX(${col}$2:${col}${r - 1},{p - 1})={i}'
-                  for col in fo_cols for p in (r - 4, r - 3, r - 2, r - 1) if p >= 2]
-            mt = "OR(" + ",".join(mt) + ")" if mt else "FALSE"
+            # Off-Friday requires FO on ALL four Mon-Thu days of the current
+            # week (Friday rows r-4..r-1); a partial week earns no Friday off.
+            # Per day: OR over the FO-assignee slots; across days: AND.
+            days = [p for p in (r - 4, r - 3, r - 2, r - 1) if p >= 2]
+            if len(days) == 4:
+                mt = "AND(" + ",".join(
+                    "OR(" + ",".join(f'INDEX(${col}$2:${col}${r - 1},{p - 1})={i}'
+                                     for col in fo_cols) + ")"
+                    for p in days) + ")"
+            else:
+                mt = "FALSE"
             ca.cell(row=r, column=MT0 + i, value=(
                 f'=IF(OR(Roster!$A{rr}="",{wd}<>5),"",{mt})'))
         for j in range(1, MAX_FO + 1):
