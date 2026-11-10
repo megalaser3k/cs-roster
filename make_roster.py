@@ -216,9 +216,9 @@ def build(path):
             cr = FIRST_EMP_ROW + i
             h = (f'IFERROR(INDEX(Feiertage!$B$2:$Q$17,MATCH($A{r},Feiertage!$A$2:$A$17,0),'
                  f'MATCH(Config!$B${cr},Feiertage!$B$1:$Q$1,0)),"")')
-            vac = (f'SUMPRODUCT((Urlaub!$A$2:$A${1 + URLAUB_ROWS}=Config!$A${cr})'
-                   f'*(Urlaub!$B$2:$B${1 + URLAUB_ROWS}<=$A{r})'
-                   f'*(Urlaub!$C$2:$C${1 + URLAUB_ROWS}>=$A{r}))>0')
+            vac = (f'COUNTIFS(Urlaub!$A$2:$A${1 + URLAUB_ROWS},Config!$A${cr},'
+                   f'Urlaub!$B$2:$B${1 + URLAUB_ROWS},"<="&$A{r},'
+                   f'Urlaub!$C$2:$C${1 + URLAUB_ROWS},">="&$A{r})>0')
             formula = (
                 f'=IF(OR($A{r}="",Config!$E$3=0,Config!$A${cr}=""),"",'
                 f'IF({vac},"Urlaub",'
@@ -282,8 +282,8 @@ def build(path):
         aw.cell(row=r, column=6, value=f'=IF($A{r}="","",COUNTIF({rng},"frei"))')
         aw.cell(row=r, column=7, value=f'=IF($A{r}="","",COUNTIF({rng},"Urlaub"))')
         aw.cell(row=r, column=8,
-                value=(f'=IF($A{r}="","",SUMPRODUCT(({rng}<>"FO")*({rng}<>"BO")*'
-                       f'({rng}<>"frei")*({rng}<>"Urlaub")*({rng}<>"")))'))
+                value=(f'=IF($A{r}="","",COUNTIFS({rng},"<>FO",{rng},"<>BO",'
+                       f'{rng},"<>frei",{rng},"<>Urlaub",{rng},"<>"))'))
         aw.cell(row=r, column=9, value=f'=IF($A{r}="","",10*(C{r}-D{r})+8*D{r}+8*E{r})')
     aw.column_dimensions["A"].width = 28
     aw.column_dimensions["B"].width = 12
