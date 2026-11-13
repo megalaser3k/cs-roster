@@ -1,17 +1,27 @@
 """Generates a formula-driven Excel roster planner for German teams.
 
 Sheets:
-  Config     - year input, employee list with Bundesland
-  Feiertage  - German public holidays for the configured year, per Bundesland
-  Roster     - one row per working day (Mon-Fri), one column per employee
-  Auswertung - per-employee totals and hours
+  Konfiguration - year input, FO strength, employee list with Bundesland, legend
+  Feiertage     - German public holidays for the configured year, per Bundesland
+                  (incl. 24.12. Heiligabend and 31.12. Silvester for all states)
+  Urlaub        - vacation periods per employee (start/end dates)
+  Calc          - hidden helper: day engine (dates, FO assignees, absence/blocked)
+  Dienstplan    - table: one row per (ISO week x employee), columns KW |
+                  Mitarbeiter | Mo..Fr with FO/BO/frei/Urlaub/holiday
+  Auswertung    - per-employee totals and hours
 """
 import datetime
+import re
+import shutil
+import zipfile
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, Protection
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
-from openpyxl.formatting.rule import CellIsRule
+from openpyxl.worksheet.table import Table, TableStyleInfo, TableColumn
+from openpyxl.worksheet.filters import AutoFilter, FilterColumn, CustomFilters, CustomFilter
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
+from openpyxl.workbook.defined_name import DefinedName
 
 STATES = ["BW", "BY", "BE", "BB", "HB", "HH", "HE", "MV",
           "NI", "NW", "RP", "SL", "SN", "ST", "SH", "TH"]
@@ -19,41 +29,75 @@ STATES = ["BW", "BY", "BE", "BB", "HB", "HH", "HE", "MV",
 MAX_EMP = 60
 FIRST_EMP_ROW = 6
 LAST_EMP_ROW = FIRST_EMP_ROW + MAX_EMP - 1
-ROSTER_ROWS = 263  # max Mon-Fri days in a year is 262; one spare row
+DAYS = 263              # max Mon-Fri days in a year is 262; one spare row
+WEEKS = 54              # ISO weeks 0..53 (week 0 catches a Jan-1 Friday)
+URLAUB_ROWS = 200       # max vacation entries
+MAX_FO = 8              # max simultaneous front-office persons (Konfiguration!E4)
+FO_DEPTH = 8            # absence fallback chain length
 
 ALL = set(STATES)
 HOLIDAYS = [
-    # (row label, date formula, short name, applicable states)
-    ("Neujahr",                 "=DATE(Config!$B$3,1,1)",     "Neujahr",        ALL),
-    ("Heilige Drei Könige",     "=DATE(Config!$B$3,1,6)",     "Dreikönige",     {"BW", "BY", "ST"}),
-    ("Internationaler Frauentag", "=DATE(Config!$B$3,3,8)",   "Frauentag",      {"BE", "MV"}),
-    ("Karfreitag",              "=$U$13-2",                   "Karfreitag",     ALL),
-    ("Ostermontag",             "=$U$13+1",                   "Ostermontag",    ALL),
-    ("Tag der Arbeit",          "=DATE(Config!$B$3,5,1)",     "1. Mai",         ALL),
-    ("Christi Himmelfahrt",     "=$U$13+39",                  "Himmelfahrt",    ALL),
-    ("Pfingstmontag",           "=$U$13+50",                  "Pfingstmontag",  ALL),
-    ("Fronleichnam",            "=$U$13+60",                  "Fronleichnam",   {"BW", "BY", "HE", "NW", "RP", "SL"}),
-    ("Mariä Himmelfahrt",       "=DATE(Config!$B$3,8,15)",    "Mariä Himmelfahrt", {"BY", "SL"}),
-    ("Tag der Deutschen Einheit", "=DATE(Config!$B$3,10,3)",  "Dt. Einheit",    ALL),
-    ("Reformationstag",         "=DATE(Config!$B$3,10,31)",   "Reformationstag", {"BB", "HB", "HH", "MV", "NI", "SN", "ST", "SH", "TH"}),
-    ("Allerheiligen",           "=DATE(Config!$B$3,11,1)",    "Allerheiligen",  {"BW", "BY", "NW", "RP", "SL"}),
-    ("Buß- und Bettag",         "=DATE(Config!$B$3,11,22)-WEEKDAY(DATE(Config!$B$3,11,22),3)+2", "Buß-/Bettag", {"SN"}),
-    ("1. Weihnachtstag",        "=DATE(Config!$B$3,12,25)",   "Weihnachten",    ALL),
-    ("2. Weihnachtstag",        "=DATE(Config!$B$3,12,26)",   "2. Weihnachtstag", ALL),
+    # (label, date formula, short name, applicable states)
+    ("Neujahr",                 "=DATE(JAHR,1,1)",    "Neujahr",        ALL),
+    ("Heilige Drei Könige",     "=DATE(JAHR,1,6)",    "Dreikönige",     {"BW", "BY", "ST"}),
+    ("Internationaler Frauentag", "=DATE(JAHR,3,8)",  "Frauentag",      {"BE", "MV"}),
+    ("Karfreitag",              "=$U$13-2",          "Karfreitag",     ALL),
+    ("Ostermontag",             "=$U$13+1",          "Ostermontag",    ALL),
+    ("Tag der Arbeit",          "=DATE(JAHR,5,1)",    "1. Mai",         ALL),
+    ("Christi Himmelfahrt",     "=$U$13+39",         "Himmelfahrt",    ALL),
+    ("Pfingstmontag",           "=$U$13+50",         "Pfingstmontag",  ALL),
+    ("Fronleichnam",            "=$U$13+60",         "Fronleichnam",   {"BW", "BY", "HE", "NW", "RP", "SL"}),
+    ("Mariä Himmelfahrt",       "=DATE(JAHR,8,15)",   "Mariä Himmelfahrt", {"BY", "SL"}),
+    ("Weltkindertag",           "=DATE(JAHR,9,20)",   "Weltkindertag",  {"TH"}),
+    ("Tag der Deutschen Einheit", "=DATE(JAHR,10,3)", "Dt. Einheit",   ALL),
+    ("Reformationstag",         "=DATE(JAHR,10,31)",  "Reformationstag", {"BB", "HB", "HH", "MV", "NI", "SN", "ST", "SH", "TH"}),
+    ("Allerheiligen",           "=DATE(JAHR,11,1)",   "Allerheiligen",  {"BW", "BY", "NW", "RP", "SL"}),
+    ("Buß- und Bettag",         "=DATE(JAHR,11,23)-(WEEKDAY(DATE(JAHR,11,23),1)-1)-4", "Buß-/Bettag", {"SN"}),
+    ("Heiligabend",             "=DATE(JAHR,12,24)",  "Heiligabend",    ALL),  # betriebsfrei, kein gesetzl. Feiertag
+    ("1. Weihnachtstag",        "=DATE(JAHR,12,25)",  "Weihnachten",    ALL),
+    ("2. Weihnachtstag",        "=DATE(JAHR,12,26)",  "2. Weihnachtstag", ALL),
+    ("Silvester",               "=DATE(JAHR,12,31)",  "Silvester",      ALL),  # betriebsfrei, kein gesetzl. Feiertag
 ]
 
-HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
+HEADER_FILL = PatternFill("solid", fgColor="FF1F4E78")
 HEADER_FONT = Font(bold=True, color="FFFFFF")
 TITLE_FONT = Font(bold=True, size=14)
-THIN = Border(*[Side(style="thin", color="BFBFBF")] * 4)
+THIN = Border(*[Side(style="thin", color="FFBFBFBF")] * 4)
+
+# dxf fills: Excel reads the solid fill colour from bgColor, alpha must be FF
+FILL_FO = PatternFill("solid", fgColor="FFBDD7EE", bgColor="FFBDD7EE")       # blue
+FILL_BO = PatternFill("solid", fgColor="FFC6EFCE", bgColor="FFC6EFCE")       # green
+FILL_FREI = PatternFill("solid", fgColor="FFD9D9D9", bgColor="FFD9D9D9")     # grey
+FILL_URLAUB = PatternFill("solid", fgColor="FFFFEB9C", bgColor="FFFFEB9C")   # yellow
+FILL_HOLIDAY = PatternFill("solid", fgColor="FFFFC7CE", bgColor="FFFFC7CE")  # red
+FILL_WEEK = PatternFill("solid", fgColor="FFEDEDED", bgColor="FFEDEDED")     # week band
+FILL_INPUT = PatternFill("solid", fgColor="FFFFF2CC", bgColor="FFFFF2CC")    # editable input cells
+
+
+def unlock(ws, ref):
+    """Mark input cells as editable (unlocked) and colour them yellow."""
+    cells = ws[ref]
+    if not isinstance(cells, tuple):
+        cells = ((cells,),)
+    for row in cells:
+        for c in row:
+            c.protection = Protection(locked=False)
+            c.fill = FILL_INPUT
+
+
+def protect(ws):
+    """Lock the sheet (formulas read-only) but keep table filter/sort usable."""
+    ws.protection.sheet = True
+    ws.protection.autoFilter = False
+    ws.protection.sort = False
 
 
 def build(path):
     wb = Workbook()
 
-    # ---------------- Config ----------------
+    # ---------------- Konfiguration ----------------
     cfg = wb.active
-    cfg.title = "Config"
+    cfg.title = "Konfiguration"
     cfg["A1"] = "Roster-Konfiguration"
     cfg["A1"].font = TITLE_FONT
     cfg["A3"] = "Jahr"
@@ -63,6 +107,19 @@ def build(path):
     cfg["D3"] = "Anzahl Mitarbeiter"
     cfg["D3"].font = Font(bold=True)
     cfg["E3"] = f"=COUNTA(A{FIRST_EMP_ROW}:A{LAST_EMP_ROW})"
+    cfg["D4"] = "Personen im Front-Office"
+    cfg["D4"].font = Font(bold=True)
+    cfg["E4"] = 1
+    cfg["E4"].number_format = "0"
+    dv_fo = DataValidation(type="whole", operator="between",
+                           formula1="1", formula2=str(MAX_FO), allow_blank=False)
+    cfg.add_data_validation(dv_fo)
+    dv_fo.add("E4")
+    cfg["D5"] = "FO-Plausibilität"
+    cfg["D5"].font = Font(bold=True)
+    cfg["E5"] = ('=IF(E3=0,"-",IF(2*E4>E3,'
+                 '"HINWEIS: 2x FO-Staerke > Mitarbeiter - FO-Abdeckung evtl. reduziert",'
+                 '"OK"))')
 
     cfg["A5"] = "Name"
     cfg["B5"] = "Bundesland"
@@ -70,31 +127,65 @@ def build(path):
         cfg[c].fill = HEADER_FILL
         cfg[c].font = HEADER_FONT
     dv = DataValidation(type="list", formula1='"' + ",".join(STATES) + '"',
-                        allow_blank=True, showDropDown=False)
+                        allow_blank=True)
     cfg.add_data_validation(dv)
     dv.add(f"B{FIRST_EMP_ROW}:B{LAST_EMP_ROW}")
 
+    wb.defined_names["MitarbeiterNamen"] = DefinedName(
+        "MitarbeiterNamen", attr_text=f"Konfiguration!$A${FIRST_EMP_ROW}:$A${LAST_EMP_ROW}")
+    for name, ref in [
+        ("N_MA", "Konfiguration!$E$3"), ("K_FO", "Konfiguration!$E$4"),
+        ("JAHR", "Konfiguration!$B$3"), ("ANKER", "Calc!$J$1"),
+        ("URL_A", f"Urlaub!$A$2:$A${1 + URLAUB_ROWS}"),
+        ("URL_B", f"Urlaub!$B$2:$B${1 + URLAUB_ROWS}"),
+        ("URL_C", f"Urlaub!$C$2:$C${1 + URLAUB_ROWS}"),
+        ("FT_A", "Feiertage!$A$2:$A$20"), ("FT_BQ", "Feiertage!$B$2:$Q$20"),
+        ("FT_H", "Feiertage!$B$1:$Q$1"),
+    ]:
+        wb.defined_names[name] = DefinedName(name, attr_text=ref)
+
     legend = [
         "Legende:",
-        "FO  = Front-Office (Mo-Do je 10 h, Fr 8 h)",
-        "BO  = Back-Office (8 h)",
-        "frei = Ausgleichs-Freitag nach der Front-Office-Woche",
-        "Feiertagsname = arbeitsfrei (Feiertag im eigenen Bundesland)",
+        "FO  = Front-Office (Mo-Do je 10 h, Fr 8 h) - blau",
+        "BO  = Back-Office (8 h) - grün",
+        "frei = Ausgleichs-Freitag nach kompletter FO-Woche - grau",
+        "(nur bei FO an ALLEN vier Tagen Mo-Do; Teilwochen oder reine",
+        "Freitags-Vertretungen geben keinen frei-Tag),",
+        "Urlaub = Urlaubstag (Zeiträume auf Blatt 'Urlaub' eintragen) - gelb",
+        "Feiertagsname = arbeitsfrei (Feiertag im eigenen Bundesland, - rot",
+        "24.12. und 31.12. gelten betriebsfrei fuer alle)",
+        "Jede zweite KW ist im Dienstplan hellgrau unterlegt.",
         "",
-        "Jedes/r Mitarbeiter/in ist alle N Wochen (N = Anzahl Mitarbeiter)",
-        "im Front-Office: Freitag der Start, dann Mo-Do der Folgewoche,",
-        "der folgende Freitag ist frei.",
+        "Blatt 'Dienstplan': eine Zeile pro Mitarbeiter, eine Spalte",
+        "pro Arbeitstag (Datum in der Kopfzeile). Autofilter in Zeile 1;",
+        "jede zweite KW ist in der Kopfzeile hellgrau unterlegt.",
         "",
-        "Hinweis: Fällt ein Front-Office-Tag auf einen Feiertag im eigenen",
-        "Bundesland, ist die Front-Office-Abdeckung manuell zu planen.",
+        "Jedes/r Mitarbeiter/in ist alle N/K Wochen im Front-Office",
+        "(N = Anzahl Mitarbeiter, K = FO-Staerke in E4): pro Woche eine",
+        "Gruppe von K Personen - Freitag der Start, dann Mo-Do der",
+        "Folgewoche, der folgende Freitag ist frei (10-h-Tage Mo-Do).",
+        "",
+        "Niemand arbeitet zwei FO-Wochen hintereinander: die Vertretung",
+        "(Urlaub/Feiertag) geht an die naechste freie Person, aber nie an",
+        "jemanden, der in der Vorwoche schon FO hatte. Ist niemand frei,",
+        "bleibt FO an dem Tag unbesetzt.",
         "",
         "Zukunftssicher: Zum Jahreswechsel nur das Jahr in B3 ändern.",
+        "",
+        "Alle Blätter sind schreibgeschützt; nur die gelb markierten",
+        "Eingabefelder (Jahr, FO-Staerke, Namen/Bundesländer, Urlaub)",
+        "sind bearbeitbar. Schutz ohne Passwort (Überprüfen > Blattschutz",
+        "aufheben, falls nötig).",
     ]
-    for i, line in enumerate(legend, start=5):
+    for i, line in enumerate(legend, start=7):
         cfg[f"D{i}"] = line
     cfg.column_dimensions["A"].width = 28
     cfg.column_dimensions["B"].width = 14
     cfg.column_dimensions["D"].width = 62
+    unlock(cfg, "B3")
+    unlock(cfg, "E4")
+    unlock(cfg, f"A{FIRST_EMP_ROW}:B{LAST_EMP_ROW}")
+    protect(cfg)
 
     # ---------------- Feiertage ----------------
     ft = wb.create_sheet("Feiertage")
@@ -125,7 +216,7 @@ def build(path):
     # Easter helpers (Gauss algorithm) in column T/U
     helpers = [
         ("Oster-Hilfsberechnung (Gauss)", None),
-        ("Jahr", "=Config!$B$3"),
+        ("Jahr", "=JAHR"),
         ("a = Jahr mod 19", "=MOD(U2,19)"),
         ("b = Jahr mod 4", "=MOD(U2,4)"),
         ("c = Jahr mod 7", "=MOD(U2,7)"),
@@ -146,98 +237,286 @@ def build(path):
                 cell.number_format = "DD.MM.YYYY"
     ft.column_dimensions["T"].width = 26
     ft.freeze_panes = "B2"
+    protect(ft)
 
-    # ---------------- Roster ----------------
-    ro = wb.create_sheet("Roster")
-    ro["A1"], ro["B1"], ro["C1"] = "Datum", "Tag", "KW"
-    for c in ("A1", "B1", "C1"):
-        ro[c].fill = HEADER_FILL
-        ro[c].font = HEADER_FONT
+    # ---------------- Urlaub ----------------
+    ur = wb.create_sheet("Urlaub")
+    for j, h in enumerate(["Mitarbeiter", "Von", "Bis"], start=1):
+        c = ur.cell(row=1, column=j, value=h)
+        c.fill = HEADER_FILL
+        c.font = HEADER_FONT
+    for r in range(2, 2 + URLAUB_ROWS):
+        ur.cell(row=r, column=2).number_format = "DD.MM.YYYY"
+        ur.cell(row=r, column=3).number_format = "DD.MM.YYYY"
+    dv2 = DataValidation(type="list", formula1="MitarbeiterNamen", allow_blank=True)
+    ur.add_data_validation(dv2)
+    dv2.add(f"A2:A{1 + URLAUB_ROWS}")
+    ur["E1"] = "Mehrere Urlaube pro Person: einfach mehrere Zeilen mit demselben Namen eintragen."
+    ur["E1"].font = Font(italic=True)
+    ur.column_dimensions["A"].width = 28
+    ur.column_dimensions["B"].width = 12
+    ur.column_dimensions["C"].width = 12
+    ur.freeze_panes = "A2"
+    unlock(ur, f"A2:C{1 + URLAUB_ROWS}")
+    protect(ur)
+
+    # ------------- Calc (hidden day engine; size-optimized) -------------
+    # Week anchor: named cell ANKER = Calc!$J$1 = DATE(2000,1,3), a Monday in
+    # both Excel's and LibreOffice's serial systems.
+    # Calc row r (2..264) = the r-th working day (Mon-Fri) of the year.
+    # Columns: DATECOL = date, A..H = FO assignees, I = FO base, J = FOSet,
+    # K..BR = absence flags, BS.. = blocked flags, EA = MonRow helper,
+    # EB.. = wasFOprev, GL.. = wasFO Mon-Thu (off-Friday)
+    ca = wb.create_sheet("Calc")
+    ABSENT0 = 11
+    BLOCK0 = ABSENT0 + MAX_EMP
+    MONROW = BLOCK0 + MAX_EMP
+    WASFO0 = MONROW + 1
+    MT0 = WASFO0 + MAX_EMP
+    DATECOL = MT0 + MAX_EMP
+    dl = get_column_letter(DATECOL)
+    absent_last = get_column_letter(ABSENT0 + MAX_EMP - 1)
+    block_col = get_column_letter(BLOCK0)
+    block_last = get_column_letter(BLOCK0 + MAX_EMP - 1)
+    mt_last = get_column_letter(MT0 + MAX_EMP - 1)
+    fo_cols = [get_column_letter(1 + j) for j in range(MAX_FO)]
+    ca["I1"] = "anker (Montag)"
+    ca["J1"] = "=DATE(2000,1,3)"
+    ca["J1"].number_format = "DD.MM.YYYY"
+    wb.defined_names["CALCD"] = DefinedName("CALCD", attr_text=f"Calc!${dl}$2:${dl}${1 + DAYS}")
+    for r in range(2, 2 + DAYS):
+        dc = f'${dl}{r}'
+        # date of this working day
+        if r == 2:
+            ca.cell(row=r, column=DATECOL,
+                    value=f'=DATE(JAHR,1,1)+IF(WEEKDAY(DATE(JAHR,1,1),2)>5,8-WEEKDAY(DATE(JAHR,1,1),2),0)')
+        else:
+            prev = f'${dl}{r - 1}'
+            ca.cell(row=r, column=DATECOL,
+                    value=(f'=IF({prev}="","",IF({prev}>=DATE(JAHR,12,31),"",'
+                           f'IF(WEEKDAY({prev},2)=5,{prev}+3,{prev}+1)))'))
+        ca.cell(row=r, column=DATECOL).number_format = "DD.MM.YYYY"
+        fr = f'$J$2:$J${r - 1}'
+        w = f'INT(({dc}-ANKER)/7)'
+        blockw = f'({w}-IF(WEEKDAY({dc},2)=5,0,1))'
+        ca.cell(row=r, column=9,
+                value=f'=IF({dc}="","",MOD({blockw}*K_FO,N_MA))')
+        mc = f'${get_column_letter(MONROW)}{r}'
+        ca.cell(row=r, column=MONROW,
+                value=f'=IF({dc}="","",ROW()-WEEKDAY({dc},2)+1)')
+        for j in range(1, MAX_FO + 1):
+            if j == 1:
+                start = f'MOD($I{r},N_MA)'
+                guard = f'OR({dc}="",K_FO<{j})'
+            else:
+                prevcell = f'{fo_cols[j - 2]}{r}'
+                start = f'MOD(IF({prevcell}="",0,{prevcell})+1,N_MA)'
+                guard = f'OR({dc}="",K_FO<{j},{prevcell}="")'
+
+            def blocked(k, start=start, r=r):
+                return (f'INDEX(${block_col}{r}:${block_last}{r},1,'
+                        f'MOD({start}+{k},N_MA)+1)')
+
+            def assigned(k, start=start, r=r, j=j):
+                terms = [f'${c}{r}=MOD({start}+{k},N_MA)' for c in fo_cols[:j - 1]]
+                return "OR(" + ",".join(terms) + ")" if terms else "FALSE"
+
+            chain = '""'
+            for k in range(FO_DEPTH - 1, -1, -1):
+                chain = (f'IF(NOT(OR({blocked(k)},{assigned(k)})),'
+                         f'MOD({start}+{k},N_MA),{chain})')
+            ca.cell(row=r, column=j, value=f'=IF({guard},"",{chain})')
+        foset_sep = '&","&'
+        ca.cell(row=r, column=10, value=(
+            f'=IF({dc}="","",","&{foset_sep.join(f"{c}{r}" for c in fo_cols)}&",")'))
+        wd = f'WEEKDAY({dc},2)'
+        for i in range(MAX_EMP):
+            cr = FIRST_EMP_ROW + i
+            ca.cell(row=r, column=ABSENT0 + i, value=(
+                f'=IF(OR({dc}="",Konfiguration!$A${cr}=""),"",OR('
+                f'COUNTIFS(URL_A,Konfiguration!$A${cr},URL_B,"<="&{dc},'
+                f'URL_C,">="&{dc})>0,'
+                f'IFERROR(INDEX(FT_BQ,MATCH({dc},FT_A,0),'
+                f'MATCH(Konfiguration!$B${cr},FT_H,0)),"")<>""))'))
+            fri = [f'ISNUMBER(SEARCH(","&{i}&",",INDEX({fr},{p - 1})))'
+                   for p in (r - 5, r - 4, r - 3, r - 2, r - 1) if p >= 2]
+            mon = [f'IF(AND({mc}-{d}-1>=1,{mc}-{d}-1<={r - 2}),'
+                   f'ISNUMBER(SEARCH(","&{i}&",",INDEX({fr},{mc}-{d}-1))),FALSE)'
+                   for d in (6, 5, 4, 3, 2)] if r >= 3 else []
+            if fri and mon:
+                was_prev = f'IF({wd}=5,OR({",".join(fri)}),OR({",".join(mon)}))'
+            elif fri:
+                was_prev = f'IF({wd}=5,OR({",".join(fri)}),FALSE)'
+            elif mon:
+                was_prev = f'IF({wd}<5,OR({",".join(mon)}),FALSE)'
+            else:
+                was_prev = "FALSE"
+            ca.cell(row=r, column=WASFO0 + i, value=(
+                f'=IF(OR({dc}="",Konfiguration!$A${cr}=""),"",{was_prev})'))
+            ca.cell(row=r, column=BLOCK0 + i, value=(
+                f'=IF(OR({dc}="",Konfiguration!$A${cr}=""),"",'
+                f'OR({get_column_letter(ABSENT0 + i)}{r},'
+                f'{get_column_letter(WASFO0 + i)}{r}))'))
+            days = [p for p in (r - 4, r - 3, r - 2, r - 1) if p >= 2]
+            if len(days) == 4:
+                mt = "AND(" + ",".join(
+                    f'ISNUMBER(SEARCH(","&{i}&",",INDEX({fr},{p - 1})))'
+                    for p in days) + ")"
+            else:
+                mt = "FALSE"
+            ca.cell(row=r, column=MT0 + i, value=(
+                f'=IF(OR({dc}="",Konfiguration!$A${cr}="",{wd}<>5),"",{mt})'))
+    ca.sheet_state = "hidden"
+    protect(ca)
+
+    # ---------------- Dienstplan (one row per employee, one column per day) ----------------
+    ro = wb.create_sheet("Dienstplan")
+    last_col = get_column_letter(1 + DAYS)
+    last_row = 1 + MAX_EMP
+    fri_row = last_row + 2  # hidden helper row: 1 on Fridays
+    # header row 1: A1 = Mitarbeiter, B1.. = day dates (formulas, from Calc)
+    ro["A1"] = "Mitarbeiter"
+    for c in range(2, 2 + DAYS):
+        cell = ro.cell(row=1, column=c, value=f'=IF(Calc!${dl}{c}="","",Calc!${dl}{c})')
+        cell.number_format = "DD.MM."
+    for c in range(2, 2 + DAYS):
+        ro.cell(row=fri_row, column=c,
+                value=f'=IF(WEEKDAY(B$1,2)=5,1,0)'.replace("B$1", f"{get_column_letter(c)}$1"))
+    ro.row_dimensions[fri_row].hidden = True
     for i in range(MAX_EMP):
-        col = get_column_letter(4 + i)
-        cell = ro.cell(row=1, column=4 + i,
-                       value=f"=IF(Config!A{FIRST_EMP_ROW + i}=\"\",\"\",Config!A{FIRST_EMP_ROW + i})")
+        r = 2 + i
+        cr = FIRST_EMP_ROW + i
+        ro.cell(row=r, column=1,
+                value=f'=IF(Konfiguration!$A${cr}="","",Konfiguration!$A${cr})')
+        mtcol = get_column_letter(MT0 + i)
+        for c in range(2, 2 + DAYS):
+            dt = f'Calc!${dl}{c}'
+            vac = (f'COUNTIFS(URL_A,$A{r},URL_B,"<="&{dt},URL_C,">="&{dt})>0')
+            hol = (f'IFERROR(INDEX(FT_BQ,MATCH({dt},FT_A,0),'
+                   f'MATCH(Konfiguration!$B${cr},FT_H,0)),"")')
+            frei = (f'AND(WEEKDAY({dt},2)=5,'
+                    f'INDEX(Calc!${mtcol}$2:${mtcol}${1 + DAYS},{c}-1)=TRUE)')
+            fo = "OR(" + ",".join(
+                f'INDEX(Calc!$A$2:$H${1 + DAYS},{c}-1,{j})={i}'
+                for j in range(1, MAX_FO + 1)) + ")"
+            formula = (
+                f'=IF($A{r}="","",IF({dt}="","",'
+                f'IF({vac},"Urlaub",'
+                f'IF({hol}<>"",{hol},'
+                f'IF({frei},"frei",'
+                f'IF({fo},"FO","BO"))))))'
+            )
+            cell = ro.cell(row=r, column=c, value=formula)
+            cell.alignment = Alignment(horizontal="center")
+    # header styling
+    for c in range(1, 2 + DAYS):
+        cell = ro.cell(row=1, column=c)
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
         cell.alignment = Alignment(horizontal="center")
-
-    for r in range(2, 2 + ROSTER_ROWS):
-        if r == 2:
-            ro.cell(row=r, column=1,
-                    value="=DATE(Config!$B$3,1,1)+IF(WEEKDAY(DATE(Config!$B$3,1,1),2)>5,8-WEEKDAY(DATE(Config!$B$3,1,1),2),0)")
-        else:
-            prev = f"$A{r - 1}"
-            ro.cell(row=r, column=1,
-                    value=(f'=IF({prev}="","",IF({prev}>=DATE(Config!$B$3,12,31),"",'
-                           f'IF(WEEKDAY({prev},2)=5,{prev}+3,{prev}+1)))'))
-        ro.cell(row=r, column=1).number_format = "DD.MM.YYYY"
-        ro.cell(row=r, column=2,
-                value=f'=IF($A{r}="","",CHOOSE(WEEKDAY($A{r},2),"Mo","Di","Mi","Do","Fr","Sa","So"))')
-        ro.cell(row=r, column=3, value=f'=IF($A{r}="","",WEEKNUM($A{r},21))')
-
-        for i in range(MAX_EMP):
-            cr = FIRST_EMP_ROW + i
-            h = (f'IFERROR(INDEX(Feiertage!$B$2:$Q$17,MATCH($A{r},Feiertage!$A$2:$A$17,0),'
-                 f'MATCH(Config!$B${cr},Feiertage!$B$1:$Q$1,0)),"")')
-            formula = (
-                f'=IF(OR($A{r}="",Config!$E$3=0,Config!$A${cr}=""),"",'
-                f'IF({h}<>"",{h},'
-                f'IF(AND(WEEKDAY($A{r},2)=5,MOD(INT(($A{r}-DATE(1900,1,2))/7)-2,Config!$E$3)={i}),"frei",'
-                f'IF(MOD(INT(($A{r}-DATE(1900,1,2))/7)-1-IF(WEEKDAY($A{r},2)=5,0,1),Config!$E$3)={i},"FO","BO"))))'
-            )
-            cell = ro.cell(row=r, column=4 + i, value=formula)
-            cell.alignment = Alignment(horizontal="center")
-            cell.border = THIN
-
-    last_col = get_column_letter(3 + MAX_EMP)
-    last_row = 1 + ROSTER_ROWS
+    ro.column_dimensions["A"].width = 24
+    for c in range(2, 2 + DAYS):
+        ro.column_dimensions[get_column_letter(c)].width = 7
+    data_range = f"B2:{last_col}{last_row}"
+    ro.conditional_formatting.add(data_range, CellIsRule(
+        operator="equal", formula=['"FO"'], fill=FILL_FO, stopIfTrue=True))
+    ro.conditional_formatting.add(data_range, CellIsRule(
+        operator="equal", formula=['"BO"'], fill=FILL_BO, stopIfTrue=True))
+    ro.conditional_formatting.add(data_range, CellIsRule(
+        operator="equal", formula=['"frei"'], fill=FILL_FREI, stopIfTrue=True))
+    ro.conditional_formatting.add(data_range, CellIsRule(
+        operator="equal", formula=['"Urlaub"'], fill=FILL_URLAUB, stopIfTrue=True))
+    ro.conditional_formatting.add(data_range, FormulaRule(
+        formula=['AND(B2<>"",B2<>"FO",B2<>"BO",B2<>"frei",B2<>"Urlaub")'],
+        fill=FILL_HOLIDAY, stopIfTrue=True))
+    # alternate week shading on the header row
     ro.conditional_formatting.add(
-        f"D2:{last_col}{last_row}",
-        CellIsRule(operator="equal", formula=['"FO"'],
-                   fill=PatternFill("solid", fgColor="BDD7EE")))
-    ro.conditional_formatting.add(
-        f"D2:{last_col}{last_row}",
-        CellIsRule(operator="equal", formula=['"frei"'],
-                   fill=PatternFill("solid", fgColor="D9D9D9")))
-    ro.column_dimensions["A"].width = 12
-    ro.column_dimensions["B"].width = 6
-    ro.column_dimensions["C"].width = 6
-    for i in range(MAX_EMP):
-        ro.column_dimensions[get_column_letter(4 + i)].width = 12
-    ro.freeze_panes = "D2"
-
+        f"B1:{last_col}1",
+        FormulaRule(formula=[f'MOD(INT((B$1-ANKER)/7),2)=1'], fill=FILL_WEEK))
+    # plain auto-filter (headers are formulas, so no ListObject table here)
+    ro.auto_filter.ref = f"A1:{last_col}{last_row}"
+    ro.auto_filter.filterColumn = [FilterColumn(
+        colId=0,  # column A = Mitarbeiter
+        customFilters=CustomFilters(_and=False, customFilter=[
+            CustomFilter(operator="notEqual", val="")]))]
+    ro.freeze_panes = "B2"
+    protect(ro)
     # ---------------- Auswertung ----------------
     aw = wb.create_sheet("Auswertung")
-    headers = ["Name", "Bundesland", "FO-Tage", "davon Freitag", "BO-Tage",
-               "Freitage", "Feiertage", "Stunden"]
-    for j, h in enumerate(headers, start=1):
+    headers_aw = ["Name", "Bundesland", "FO-Tage", "davon Freitag", "BO-Tage",
+                  "Freitage", "Urlaub", "Feiertage", "Stunden"]
+    for j, h in enumerate(headers_aw, start=1):
         c = aw.cell(row=1, column=j, value=h)
         c.fill = HEADER_FILL
         c.font = HEADER_FONT
     for i in range(MAX_EMP):
         r = 2 + i
         cr = FIRST_EMP_ROW + i
-        col = get_column_letter(4 + i)
-        rng = f"Roster!{col}$2:{col}${last_row}"
-        aw.cell(row=r, column=1, value=f'=IF(Config!A{cr}="","",Config!A{cr})')
-        aw.cell(row=r, column=2, value=f'=IF(Config!A{cr}="","",Config!B{cr})')
-        aw.cell(row=r, column=3, value=f'=IF($A{r}="","",COUNTIF({rng},"FO"))')
+        rowrange = f"Dienstplan!$B{r}:${last_col}{r}"          # the employee's day cells
+        frange = f"Dienstplan!$B${fri_row}:${last_col}${fri_row}"  # 1 on Fridays
+
+        def countif_status(status):
+            return f'COUNTIF({rowrange},"{status}")'
+
+        aw.cell(row=r, column=1, value=f'=IF(Konfiguration!A{cr}="","",Konfiguration!A{cr})')
+        aw.cell(row=r, column=2, value=f'=IF(Konfiguration!A{cr}="","",Konfiguration!B{cr})')
+        aw.cell(row=r, column=3, value=f'=IF($A{r}="","",{countif_status("FO")})')
         aw.cell(row=r, column=4,
-                value=f'=IF($A{r}="","",COUNTIFS({rng},"FO",Roster!$B$2:$B${last_row},"Fr"))')
-        aw.cell(row=r, column=5, value=f'=IF($A{r}="","",COUNTIF({rng},"BO"))')
-        aw.cell(row=r, column=6, value=f'=IF($A{r}="","",COUNTIF({rng},"frei"))')
-        aw.cell(row=r, column=7,
-                value=(f'=IF($A{r}="","",SUMPRODUCT(({rng}<>"FO")*({rng}<>"BO")*'
-                       f'({rng}<>"frei")*({rng}<>"")))'))
-        aw.cell(row=r, column=8, value=f'=IF($A{r}="","",10*(C{r}-D{r})+8*D{r}+8*E{r})')
+                value=f'=IF($A{r}="","",COUNTIFS({rowrange},"FO",{frange},1))')
+        aw.cell(row=r, column=5, value=f'=IF($A{r}="","",{countif_status("BO")})')
+        aw.cell(row=r, column=6, value=f'=IF($A{r}="","",{countif_status("frei")})')
+        aw.cell(row=r, column=7, value=f'=IF($A{r}="","",{countif_status("Urlaub")})')
+        aw.cell(row=r, column=8,
+                value=(f'=IF($A{r}="","",COUNTIFS({rowrange},"<>FO",{rowrange},"<>BO",'
+                       f'{rowrange},"<>frei",{rowrange},"<>Urlaub",{rowrange},"<>"))'))
+        aw.cell(row=r, column=9, value=f'=IF($A{r}="","",10*(C{r}-D{r})+8*D{r}+8*E{r})')
     aw.column_dimensions["A"].width = 28
     aw.column_dimensions["B"].width = 12
-    for j in range(3, 9):
+    for j in range(3, 10):
         aw.column_dimensions[get_column_letter(j)].width = 13
     aw.freeze_panes = "A2"
+    protect(aw)
 
+    wb.calculation.fullCalcOnLoad = True
     wb.save(path)
+    strip_empty_cached_values(path)
+    check_formula_balance(path)
     print("saved", path)
+
+
+def strip_empty_cached_values(path):
+    """Remove empty <v/> elements that openpyxl writes after <f> formulas.
+
+    A numeric cell with an empty cached <v/> is treated as corrupt by Excel,
+    which then strips the formulas on open. With no cached values present,
+    fullCalcOnLoad makes Excel recalculate everything when the file opens.
+    """
+    tmp = path + ".tmp"
+    with zipfile.ZipFile(path) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if re.match(r"xl/worksheets/sheet\d+\.xml$", item.filename):
+                data = re.sub(rb"<v\s*/>|<v></v>", b"", data)
+            zout.writestr(item, data)
+    shutil.move(tmp, path)
+
+
+def check_formula_balance(path):
+    """Assert every stored formula has balanced parentheses (outside strings)."""
+    with zipfile.ZipFile(path) as z:
+        for n in z.namelist():
+            if re.match(r"xl/worksheets/sheet\d+\.xml$", n):
+                for f in re.findall(r"<f[^>]*>([^<]*)</f>", z.read(n).decode()):
+                    f = f.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+                    depth = 0
+                    instr = False
+                    for ch in f:
+                        if ch == '"':
+                            instr = not instr
+                        elif not instr:
+                            depth += (ch == "(") - (ch == ")")
+                    if depth != 0:
+                        raise ValueError(f"unbalanced formula in {n}: {f[:80]}")
 
 
 if __name__ == "__main__":
