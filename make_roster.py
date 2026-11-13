@@ -373,28 +373,27 @@ def build(path):
     ro = wb.create_sheet("Dienstplan")
     ro["A1"] = "KW = ISO-Kalenderwoche (Jahr in Konfiguration!B3); Mo-Fr = Status"
     ro["A1"].font = Font(italic=True)
-    headers = ["KW", "Mitarbeiter", "Mo", "Di", "Mi", "Do", "Fr"]
+    headers = ["KW", "Mitarbeiter", "Mo", "Di", "Mi", "Do", "Fr", "Woche ab (Mo)"]
     for j, h in enumerate(headers, start=1):
         c = ro.cell(row=2, column=j, value=h)
         c.fill = HEADER_FILL
         c.font = HEADER_FONT
         c.alignment = Alignment(horizontal="center")
-    # hidden helper column I: Monday of the row's week
-    ro["I2"] = "MoDatum"
     last_row = 2 + WEEKS * MAX_EMP
     for w in range(0, WEEKS):
         for i in range(MAX_EMP):
             r = 3 + w * MAX_EMP + i
             cr = FIRST_EMP_ROW + i
-            ro.cell(row=r, column=9,
+            # dense, filterable date column H: Monday of the row's week
+            ro.cell(row=r, column=8,
                     value=f'=DATE(JAHR,1,4)-WEEKDAY(DATE(JAHR,1,4),3)+7*{w}')
-            ro.cell(row=r, column=9).number_format = "DD.MM.YYYY"
-            ro.cell(row=r, column=1, value=f'=IF($I{r}="","",WEEKNUM($I{r},21))')
+            ro.cell(row=r, column=8).number_format = "DD.MM.YYYY"
+            ro.cell(row=r, column=1, value=f'=IF($H{r}="","",WEEKNUM($H{r},21))')
             ro.cell(row=r, column=2,
                     value=f'=IF(Konfiguration!$A${cr}="","",Konfiguration!$A${cr})')
             mtcol = get_column_letter(MT0 + i)
             for d in range(1, 6):
-                dt = f'($I{r}+{d - 1})'
+                dt = f'($H{r}+{d - 1})'
                 dr = f'MATCH({dt},CALCD,0)'
                 vac = (f'COUNTIFS(URL_A,$B{r},URL_B,"<="&{dt},URL_C,">="&{dt})>0')
                 hol = (f'IFERROR(INDEX(FT_BQ,MATCH({dt},FT_A,0),'
@@ -417,7 +416,7 @@ def build(path):
     ro.column_dimensions["B"].width = 24
     for d in range(3, 8):
         ro.column_dimensions[get_column_letter(d)].width = 13
-    ro.column_dimensions["I"].hidden = True
+    ro.column_dimensions["H"].width = 13
     cf_range = f"C3:G{last_row}"
     ro.conditional_formatting.add(cf_range, CellIsRule(
         operator="equal", formula=['"FO"'], fill=FILL_FO, stopIfTrue=True))
@@ -431,14 +430,14 @@ def build(path):
         formula=['AND(C3<>"",C3<>"FO",C3<>"BO",C3<>"frei",C3<>"Urlaub")'],
         fill=FILL_HOLIDAY, stopIfTrue=True))
     ro.conditional_formatting.add(
-        f"A3:G{last_row}",
+        f"A3:H{last_row}",
         FormulaRule(formula=['MOD($A3,2)=1'], fill=FILL_WEEK))
-    tab = Table(displayName="DienstplanTabelle", ref=f"A2:G{last_row}",
+    tab = Table(displayName="DienstplanTabelle", ref=f"A2:H{last_row}",
                 tableColumns=[TableColumn(id=j + 1, name=h)
                               for j, h in enumerate(headers)])
     # pre-applied filter: hide blank Mitarbeiter rows (unused employee slots)
     tab.autoFilter = AutoFilter(
-        ref=f"A2:G{last_row}",
+        ref=f"A2:H{last_row}",
         filterColumn=[FilterColumn(
             colId=1,  # column B = Mitarbeiter
             customFilters=CustomFilters(_and=False, customFilter=[
