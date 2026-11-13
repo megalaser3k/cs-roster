@@ -156,9 +156,9 @@ def build(path):
         "24.12. und 31.12. gelten betriebsfrei fuer alle)",
         "Jede zweite KW ist im Dienstplan hellgrau unterlegt.",
         "",
-        "Blatt 'Dienstplan': eine Zeile pro (KW x Mitarbeiter),",
-        "Spalten Mo-Fr. Tabelle ab Zeile 2 mit Filtern in der Kopfzeile.",
-        "KW = ISO-Kalenderwoche (Woche 0 = evtl. 1.1., falls Freitag).",
+        "Blatt 'Dienstplan': eine Zeile pro Mitarbeiter, eine Spalte",
+        "pro Arbeitstag (Datum in der Kopfzeile). Autofilter in Zeile 1;",
+        "jede zweite KW ist in der Kopfzeile hellgrau unterlegt.",
         "",
         "Jedes/r Mitarbeiter/in ist alle N/K Wochen im Front-Office",
         "(N = Anzahl Mitarbeiter, K = FO-Staerke in E4): pro Woche eine",
@@ -369,84 +369,78 @@ def build(path):
     ca.sheet_state = "hidden"
     protect(ca)
 
-    # ---------------- Dienstplan (week x employee table) ----------------
+    # ---------------- Dienstplan (one row per employee, one column per day) ----------------
     ro = wb.create_sheet("Dienstplan")
-    ro["A1"] = "KW = ISO-Kalenderwoche (Jahr in Konfiguration!B3); Mo-Fr = Status"
-    ro["A1"].font = Font(italic=True)
-    headers = ["KW", "Mitarbeiter", "Mo", "Di", "Mi", "Do", "Fr", "Woche ab (Mo)"]
-    for j, h in enumerate(headers, start=1):
-        c = ro.cell(row=2, column=j, value=h)
-        c.fill = HEADER_FILL
-        c.font = HEADER_FONT
-        c.alignment = Alignment(horizontal="center")
-    last_row = 2 + WEEKS * MAX_EMP
-    for w in range(0, WEEKS):
-        for i in range(MAX_EMP):
-            r = 3 + w * MAX_EMP + i
-            cr = FIRST_EMP_ROW + i
-            # dense, filterable date column H: Monday of the row's week
-            ro.cell(row=r, column=8,
-                    value=f'=DATE(JAHR,1,4)-WEEKDAY(DATE(JAHR,1,4),3)+7*{w}')
-            ro.cell(row=r, column=8).number_format = "DD.MM.YYYY"
-            ro.cell(row=r, column=1, value=f'=IF($H{r}="","",WEEKNUM($H{r},21))')
-            ro.cell(row=r, column=2,
-                    value=f'=IF(Konfiguration!$A${cr}="","",Konfiguration!$A${cr})')
-            mtcol = get_column_letter(MT0 + i)
-            for d in range(1, 6):
-                dt = f'($H{r}+{d - 1})'
-                dr = f'MATCH({dt},CALCD,0)'
-                vac = (f'COUNTIFS(URL_A,$B{r},URL_B,"<="&{dt},URL_C,">="&{dt})>0')
-                hol = (f'IFERROR(INDEX(FT_BQ,MATCH({dt},FT_A,0),'
-                       f'MATCH(Konfiguration!$B${cr},FT_H,0)),"")')
-                frei = f'AND({d}=5,INDEX(Calc!${mtcol}$2:${mtcol}${1 + DAYS},{dr}-1)=TRUE)'
-                fo = "OR(" + ",".join(
-                    f'INDEX(Calc!$A$2:$H${1 + DAYS},{dr}-1,{j})={i}'
-                    for j in range(1, MAX_FO + 1)) + ")"
-                formula = (
-                    f'=IF($B{r}="","",IF(ISNA({dr}),"",'
-                    f'IF({vac},"Urlaub",'
-                    f'IF({hol}<>"",{hol},'
-                    f'IF({frei},"frei",'
-                    f'IF({fo},"FO","BO"))))))'
-                )
-                cell = ro.cell(row=r, column=2 + d, value=formula)
-                cell.alignment = Alignment(horizontal="center")
-                cell.border = THIN
-    ro.column_dimensions["A"].width = 6
-    ro.column_dimensions["B"].width = 24
-    for d in range(3, 8):
-        ro.column_dimensions[get_column_letter(d)].width = 13
-    ro.column_dimensions["H"].width = 13
-    cf_range = f"C3:G{last_row}"
-    ro.conditional_formatting.add(cf_range, CellIsRule(
+    last_col = get_column_letter(1 + DAYS)
+    last_row = 1 + MAX_EMP
+    fri_row = last_row + 2  # hidden helper row: 1 on Fridays
+    # header row 1: A1 = Mitarbeiter, B1.. = day dates (formulas, from Calc)
+    ro["A1"] = "Mitarbeiter"
+    for c in range(2, 2 + DAYS):
+        cell = ro.cell(row=1, column=c, value=f'=IF(Calc!${dl}{c}="","",Calc!${dl}{c})')
+        cell.number_format = "DD.MM."
+    for c in range(2, 2 + DAYS):
+        ro.cell(row=fri_row, column=c,
+                value=f'=IF(WEEKDAY(B$1,2)=5,1,0)'.replace("B$1", f"{get_column_letter(c)}$1"))
+    ro.row_dimensions[fri_row].hidden = True
+    for i in range(MAX_EMP):
+        r = 2 + i
+        cr = FIRST_EMP_ROW + i
+        ro.cell(row=r, column=1,
+                value=f'=IF(Konfiguration!$A${cr}="","",Konfiguration!$A${cr})')
+        mtcol = get_column_letter(MT0 + i)
+        for c in range(2, 2 + DAYS):
+            dt = f'Calc!${dl}{c}'
+            vac = (f'COUNTIFS(URL_A,$A{r},URL_B,"<="&{dt},URL_C,">="&{dt})>0')
+            hol = (f'IFERROR(INDEX(FT_BQ,MATCH({dt},FT_A,0),'
+                   f'MATCH(Konfiguration!$B${cr},FT_H,0)),"")')
+            frei = (f'AND(WEEKDAY({dt},2)=5,'
+                    f'INDEX(Calc!${mtcol}$2:${mtcol}${1 + DAYS},{c}-1)=TRUE)')
+            fo = "OR(" + ",".join(
+                f'INDEX(Calc!$A$2:$H${1 + DAYS},{c}-1,{j})={i}'
+                for j in range(1, MAX_FO + 1)) + ")"
+            formula = (
+                f'=IF($A{r}="","",IF({dt}="","",'
+                f'IF({vac},"Urlaub",'
+                f'IF({hol}<>"",{hol},'
+                f'IF({frei},"frei",'
+                f'IF({fo},"FO","BO"))))))'
+            )
+            cell = ro.cell(row=r, column=c, value=formula)
+            cell.alignment = Alignment(horizontal="center")
+    # header styling
+    for c in range(1, 2 + DAYS):
+        cell = ro.cell(row=1, column=c)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center")
+    ro.column_dimensions["A"].width = 24
+    for c in range(2, 2 + DAYS):
+        ro.column_dimensions[get_column_letter(c)].width = 7
+    data_range = f"B2:{last_col}{last_row}"
+    ro.conditional_formatting.add(data_range, CellIsRule(
         operator="equal", formula=['"FO"'], fill=FILL_FO, stopIfTrue=True))
-    ro.conditional_formatting.add(cf_range, CellIsRule(
+    ro.conditional_formatting.add(data_range, CellIsRule(
         operator="equal", formula=['"BO"'], fill=FILL_BO, stopIfTrue=True))
-    ro.conditional_formatting.add(cf_range, CellIsRule(
+    ro.conditional_formatting.add(data_range, CellIsRule(
         operator="equal", formula=['"frei"'], fill=FILL_FREI, stopIfTrue=True))
-    ro.conditional_formatting.add(cf_range, CellIsRule(
+    ro.conditional_formatting.add(data_range, CellIsRule(
         operator="equal", formula=['"Urlaub"'], fill=FILL_URLAUB, stopIfTrue=True))
-    ro.conditional_formatting.add(cf_range, FormulaRule(
-        formula=['AND(C3<>"",C3<>"FO",C3<>"BO",C3<>"frei",C3<>"Urlaub")'],
+    ro.conditional_formatting.add(data_range, FormulaRule(
+        formula=['AND(B2<>"",B2<>"FO",B2<>"BO",B2<>"frei",B2<>"Urlaub")'],
         fill=FILL_HOLIDAY, stopIfTrue=True))
+    # alternate week shading on the header row
     ro.conditional_formatting.add(
-        f"A3:H{last_row}",
-        FormulaRule(formula=['MOD($A3,2)=1'], fill=FILL_WEEK))
-    tab = Table(displayName="DienstplanTabelle", ref=f"A2:H{last_row}",
-                tableColumns=[TableColumn(id=j + 1, name=h)
-                              for j, h in enumerate(headers)])
-    # pre-applied filter: hide blank Mitarbeiter rows (unused employee slots)
-    tab.autoFilter = AutoFilter(
-        ref=f"A2:H{last_row}",
-        filterColumn=[FilterColumn(
-            colId=1,  # column B = Mitarbeiter
-            customFilters=CustomFilters(_and=False, customFilter=[
-                CustomFilter(operator="notEqual", val="")]))])
-    tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=False)
-    ro.add_table(tab)
-    ro.freeze_panes = "C3"
+        f"B1:{last_col}1",
+        FormulaRule(formula=[f'MOD(INT((B$1-ANKER)/7),2)=1'], fill=FILL_WEEK))
+    # plain auto-filter (headers are formulas, so no ListObject table here)
+    ro.auto_filter.ref = f"A1:{last_col}{last_row}"
+    ro.auto_filter.filterColumn = [FilterColumn(
+        colId=0,  # column A = Mitarbeiter
+        customFilters=CustomFilters(_and=False, customFilter=[
+            CustomFilter(operator="notEqual", val="")]))]
+    ro.freeze_panes = "B2"
     protect(ro)
-
     # ---------------- Auswertung ----------------
     aw = wb.create_sheet("Auswertung")
     headers_aw = ["Name", "Bundesland", "FO-Tage", "davon Freitag", "BO-Tage",
@@ -455,31 +449,26 @@ def build(path):
         c = aw.cell(row=1, column=j, value=h)
         c.fill = HEADER_FILL
         c.font = HEADER_FONT
-    br = f"Dienstplan!$B$3:$B${last_row}"
-    daycols = [f"Dienstplan!${get_column_letter(3 + d)}$3:${get_column_letter(3 + d)}${last_row}"
-               for d in range(5)]
     for i in range(MAX_EMP):
         r = 2 + i
         cr = FIRST_EMP_ROW + i
+        rowrange = f"Dienstplan!$B{r}:${last_col}{r}"          # the employee's day cells
+        frange = f"Dienstplan!$B${fri_row}:${last_col}${fri_row}"  # 1 on Fridays
 
         def countif_status(status):
-            return "+".join(f'COUNTIFS({br},$A{r},{dc},"{status}")' for dc in daycols)
-
-        def countif_not_statuses():
-            terms = []
-            for dc in daycols:
-                terms.append(f'COUNTIFS({br},$A{r},{dc},"<>FO",{dc},"<>BO",'
-                             f'{dc},"<>frei",{dc},"<>Urlaub",{dc},"<>")')
-            return "+".join(terms)
+            return f'COUNTIF({rowrange},"{status}")'
 
         aw.cell(row=r, column=1, value=f'=IF(Konfiguration!A{cr}="","",Konfiguration!A{cr})')
         aw.cell(row=r, column=2, value=f'=IF(Konfiguration!A{cr}="","",Konfiguration!B{cr})')
         aw.cell(row=r, column=3, value=f'=IF($A{r}="","",{countif_status("FO")})')
-        aw.cell(row=r, column=4, value=f'=IF($A{r}="","",COUNTIFS({br},$A{r},{daycols[4]},"FO"))')
+        aw.cell(row=r, column=4,
+                value=f'=IF($A{r}="","",COUNTIFS({rowrange},"FO",{frange},1))')
         aw.cell(row=r, column=5, value=f'=IF($A{r}="","",{countif_status("BO")})')
         aw.cell(row=r, column=6, value=f'=IF($A{r}="","",{countif_status("frei")})')
         aw.cell(row=r, column=7, value=f'=IF($A{r}="","",{countif_status("Urlaub")})')
-        aw.cell(row=r, column=8, value=f'=IF($A{r}="","",{countif_not_statuses()})')
+        aw.cell(row=r, column=8,
+                value=(f'=IF($A{r}="","",COUNTIFS({rowrange},"<>FO",{rowrange},"<>BO",'
+                       f'{rowrange},"<>frei",{rowrange},"<>Urlaub",{rowrange},"<>"))'))
         aw.cell(row=r, column=9, value=f'=IF($A{r}="","",10*(C{r}-D{r})+8*D{r}+8*E{r})')
     aw.column_dimensions["A"].width = 28
     aw.column_dimensions["B"].width = 12
