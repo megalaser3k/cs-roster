@@ -19,7 +19,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, Protecti
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table, TableStyleInfo, TableColumn
-from openpyxl.worksheet.filters import AutoFilter
+from openpyxl.worksheet.filters import AutoFilter, FilterColumn, CustomFilters, CustomFilter
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.workbook.defined_name import DefinedName
 
@@ -436,7 +436,13 @@ def build(path):
     tab = Table(displayName="DienstplanTabelle", ref=f"A2:G{last_row}",
                 tableColumns=[TableColumn(id=j + 1, name=h)
                               for j, h in enumerate(headers)])
-    tab.autoFilter = AutoFilter(ref=f"A2:G{last_row}")
+    # pre-applied filter: hide blank Mitarbeiter rows (unused employee slots)
+    tab.autoFilter = AutoFilter(
+        ref=f"A2:G{last_row}",
+        filterColumn=[FilterColumn(
+            colId=1,  # column B = Mitarbeiter
+            customFilters=CustomFilters(_and=False, customFilter=[
+                CustomFilter(operator="notEqual", val="")]))])
     tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=False)
     ro.add_table(tab)
     ro.freeze_panes = "C3"
